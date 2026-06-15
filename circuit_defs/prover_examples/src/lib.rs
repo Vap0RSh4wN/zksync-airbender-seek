@@ -679,14 +679,24 @@ pub fn prove_image_execution_for_machine_with_gpu_tracers<
     (main_proofs, delegation_proofs, final_register_values)
 }
 
+/// 将 row-major 的 setup trace 转置为按列排列的一维 setup evaluations 向量。
+///
+/// 不重新编译电路或生成约束；输入通常来自 setup.setup.ldes[0].trace。
+///
+/// - 输入 setup_row_major：按行连续存储（row0_col0, row0_col1, …, row1_col0, …）。
+/// - 证明阶段常按列处理（每列对应一条多项式），故需转置。
+/// - 使用 padded_width 作为转置 stride（行可能含对齐 padding 列）；转置后
+///   truncate(len * width) 去掉 padding，只保留真实 行数×列数 个域元素。
 pub fn create_circuit_setup<A: GoodAllocator, B: GoodAllocator, const N: usize>(
     setup_row_major: &RowMajorTrace<Mersenne31Field, N, A>,
 ) -> Vec<Mersenne31Field, B> {
     #[cfg(feature = "gpu")]
+    // 启用 GPU feature 时确保 host 侧分配器已初始化，供后续 GPU 相关路径使用。
     gpu::initialize_host_allocator_if_needed();
 
     let mut setup_evaluations =
         Vec::with_capacity_in(setup_row_major.as_slice().len(), B::default());
+    // 预分配长度；transpose 会写满整个 buffer，故用 unsafe 跳过元素初始化。
     unsafe { setup_evaluations.set_len(setup_row_major.as_slice().len()) };
     transpose::transpose(
         setup_row_major.as_slice(),

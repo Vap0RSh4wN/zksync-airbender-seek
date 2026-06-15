@@ -114,20 +114,32 @@ pub fn delegation_factories_for_machine<C: MachineConfig, A: GoodAllocator>(
     }
 }
 
+/// Main RISC-V（或 reduced 等）电路的完整预计算包，供证明与 witness 生成使用。
+///
+/// 除约束系统外还包含 lookup 表驱动、FFT/LDE、setup commitment 预计算等。
+/// setup.setup.ldes[0].trace 为 row-major 的 setup trace，可经 create_circuit_setup 转为 evaluations。
 pub struct MainCircuitPrecomputations<C: MachineConfig, A: GoodAllocator, B: GoodAllocator = Global>
 {
+    /// 经 one_row_compiler 编译后的约束系统 artifact（trace 列布局、setup layout、quotient 等）。
     pub compiled_circuit: cs::one_row_compiler::CompiledCircuitArtifact<Mersenne31Field>,
+    /// Lookup 表驱动：ROM、decoder、range、CSR/delegation 等表的统一访问入口。
     pub table_driver: TableDriver<Mersenne31Field>,
+    /// FFT twiddles（复域 Mersenne31Complex），供 LDE 与证明后端使用。
     pub twiddles: Twiddles<Mersenne31Complex, A>,
+    /// Low-degree extension 相关预计算（domain、coset 等）。
     pub lde_precomputations: LdePrecomputations<A>,
+    /// 由固定表与 setup layout 生成的 setup 预计算；内含 ldes[0].trace 等 setup trace 数据。
     pub setup: SetupPrecomputations<DEFAULT_TRACE_PADDING_MULTIPLE, A, DefaultTreeConstructor>,
+    /// GPU tracer 用：给定 MainRiscVOracle，通过 SimpleWitnessProxy 将 witness 写入 trace。
     pub witness_eval_fn_for_gpu_tracer: fn(&mut SimpleWitnessProxy<'_, MainRiscVOracle<'_, C, B>>),
 }
 
+/// 单个 delegation circuit（如 BLAKE2、BigInt）的完整预计算包；结构上与 main 类似但无 MachineConfig 泛型。
 pub struct DelegationCircuitPrecomputations<A: GoodAllocator, B: GoodAllocator = Global> {
     pub trace_len: usize,
     pub lde_factor: usize,
     pub tree_cap_size: usize,
+    /// Delegation 处理器描述：编译后的 delegation 约束、trace 长度、表等。
     pub compiled_circuit: DelegationProcessorDescription,
     pub twiddles: Twiddles<Mersenne31Complex, A>,
     pub lde_precomputations: LdePrecomputations<A>,
@@ -199,6 +211,11 @@ pub fn get_delegation_compiled_circuits_for_reduced_machine(
     machines
 }
 
+/// 生成当前启用的全部 delegation circuit setup 列表。
+///
+/// 返回 [(delegation_type_id, DelegationCircuitPrecomputations)]。
+/// delegation_type_id 须与 RISC-V 程序通过 CSR 调用 delegation 时写入的值一致。
+/// 当前包含：BLAKE2 compression、BigInt with control（不依赖具体程序 bytecode）。
 pub fn all_delegation_circuits_precomputations<A: GoodAllocator, B: GoodAllocator>(
     worker: &Worker,
 ) -> Vec<(u32, DelegationCircuitPrecomputations<A, B>)> {
