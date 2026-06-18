@@ -24,6 +24,7 @@ impl<F: PrimeField> OneRowCompiler<F> {
         circuit_output: CircuitOutput<F>,
         trace_len_log2: usize,
     ) -> CompiledCircuitArtifact<F> {
+        // 其中false表示这不是delegation circuit，而是main chunked memory argument路径。源码里两个入口分别是compile_output_for_chunked_memory_argument和compile_to_evaluate_delegations。
         Self::compile_inner::<false>(self, circuit_output, trace_len_log2)
     }
 
@@ -41,11 +42,12 @@ impl<F: PrimeField> OneRowCompiler<F> {
         trace_len_log2: usize,
     ) -> CompiledCircuitArtifact<F> {
         // our main purposes are:
-        // - place variables in particular grid places
-        // - select whether they go into witness subtree or memory subtree
-        // - normalize constraints to address particular columns insteap of variable indexes
-        // - try to apply some heuristrics
+        // 第一，CircuitOutput里只有Variable(0)、Variable(1)这种编号；真正prover需要的是“第几列”。compiler会决定每个变量落到哪个区域、哪个列offset。
+        // 第二，Airbender的trace不是单一平面。变量可能属于普通witness列，也可能属于memory argument相关列，还可能属于setup列。compiler要把它们分区域。
+        // 第三，约束原来写成Variable表达式；compiler要把它改写成ColumnAddress表达式。后面prover/verifier评价约束时，不会再按Variable找值，而是直接从witness row、memory row、setup row里按列地址读值。
+        // 第四，compiler还会做一些布局优化和变量放置策略。这个以后读性能细节时再展开。
 
+        // 拆开
         let CircuitOutput {
             state_input,
             state_output,
@@ -66,6 +68,7 @@ impl<F: PrimeField> OneRowCompiler<F> {
 
         assert!(trace_len_log2 > TIMESTAMP_COLUMNS_NUM_BITS as usize);
 
+        // 先做分支检查：
         if FOR_DELEGATION {
             assert!(state_input.is_empty());
             assert!(state_output.is_empty());
@@ -95,6 +98,10 @@ impl<F: PrimeField> OneRowCompiler<F> {
                 );
             }
         } else {
+            // 对main RISC-V路径，FOR_DELEGATION=false
+
+            // 这说明main RISC-V每行在这一层预期有3个shuffle RAM queries。直观上可以对应典型RISC-V一行的几类访问槽位，
+            // 比如读寄存器、读寄存器/内存、写寄存器/内存。具体每个query如何对应不同opcode，后面读state transition时再展开。
             assert_eq!(shuffle_ram_queries.len(), 3);
             assert!(linked_variables.is_empty());
             assert!(degegated_request_to_process.is_none());
@@ -104,6 +111,7 @@ impl<F: PrimeField> OneRowCompiler<F> {
 
         let trace_len = 1usize << trace_len_log2;
         let total_tables_size = table_driver.total_tables_len;
+        // 为什么table encoding capacity是trace_len - 1？因为setup trace最后一行不用于普通表内容。源码里compile_inner用它计算generic lookup setup需要多少列组。
         let lookup_table_encoding_capacity = trace_len - 1;
         let mut num_required_tuples_for_generic_lookup_setup =
             total_tables_size / lookup_table_encoding_capacity;
@@ -115,6 +123,7 @@ impl<F: PrimeField> OneRowCompiler<F> {
 
         // we can immediately make setup layout
         let need_timestamps = !FOR_DELEGATION;
+        // main路径FOR_DELEGATION=false，所以need_timestamps=true。也就是说main RISC-V setup需要timestamp相关setup columns
         let setup_layout =
             SetupLayout::layout_for_lookup_size(total_tables_size, trace_len, need_timestamps);
 

@@ -121,6 +121,7 @@ pub fn delegation_factories_for_machine<C: MachineConfig, A: GoodAllocator>(
 pub struct MainCircuitPrecomputations<C: MachineConfig, A: GoodAllocator, B: GoodAllocator = Global>
 {
     /// 经 one_row_compiler 编译后的约束系统 artifact（trace 列布局、setup layout、quotient 等）。
+    /// 描述约束长什么样。例如这一列和那一列要满足加法关系，某个lookup要查RomRead表。
     pub compiled_circuit: cs::one_row_compiler::CompiledCircuitArtifact<Mersenne31Field>,
     /// Lookup 表驱动：ROM、decoder、range、CSR/delegation 等表的统一访问入口。
     pub table_driver: TableDriver<Mersenne31Field>,
@@ -129,6 +130,7 @@ pub struct MainCircuitPrecomputations<C: MachineConfig, A: GoodAllocator, B: Goo
     /// Low-degree extension 相关预计算（domain、coset 等）。
     pub lde_precomputations: LdePrecomputations<A>,
     /// 由固定表与 setup layout 生成的 setup 预计算；内含 ldes[0].trace 等 setup trace 数据。
+    /// 根据tables和trace length生成的setup commitment / trees / LDE trace
     pub setup: SetupPrecomputations<DEFAULT_TRACE_PADDING_MULTIPLE, A, DefaultTreeConstructor>,
     /// GPU tracer 用：给定 MainRiscVOracle，通过 SimpleWitnessProxy 将 witness 写入 trace。
     pub witness_eval_fn_for_gpu_tracer: fn(&mut SimpleWitnessProxy<'_, MainRiscVOracle<'_, C, B>>),

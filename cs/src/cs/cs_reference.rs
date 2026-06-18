@@ -92,14 +92,25 @@ impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
         self.witness_graph.append_inplace(node);
     }
 
+    /// 该函数确保对应table_type的查找表(materialized table)被主table_driver和可能存在的debug witness evaluator同步创建。
     fn materialize_table(&mut self, table_type: TableType) {
+        // 转发给self.table_driver.materialize_table(table)，先对主table_driver进行materialize_table操作，把指定类型的查找表物化（准备好并注册到driver里）。
         self.table_driver.materialize_table(table_type);
+
+        // 如果当前BasicAssembly存在witness_placer（witness生成器组件），则额外判断调试器case。
         if let Some(witness_placer) = self.witness_placer.as_mut() {
+            // 判断泛型W是否为CSDebugWitnessEvaluator<F>类型。如果不是则跳过。
             if std::any::TypeId::of::<W>() == std::any::TypeId::of::<CSDebugWitnessEvaluator<F>>() {
+                // 为了获取CSDebugWitnessEvaluator<F>本身，需要用裸指针类型转换绕过Rust类型系统的安全限制。
+                // 这里通过unsafe保证转换正确，调用其table_driver的materialize_table方法，实现debug下的表同步。
                 unsafe {
+                    // 首先，把witness_placer&mut转为*mut W原始指针。
                     let t = (witness_placer as *mut W)
+                        // 然后强制转换为*mut CSDebugWitnessEvaluator<F>类型。
                         .cast::<CSDebugWitnessEvaluator<F>>()
+                        // 再用as_mut_unchecked把裸指针转为可变引用。
                         .as_mut_unchecked();
+                    // 执行CSDebugWitnessEvaluator的table_driver的materialize_table。
                     t.table_driver.materialize_table(table_type);
                 }
             }
@@ -633,6 +644,8 @@ impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
         // Out default behavior is to enforce 8-bit range-checks in the same way as generic lookups.
         // Later on the compiler will place the variables, but we will add corresponding lookup queries
 
+        // 第一，它把8-bit range check成对打包成RangeCheckSmall lookup。源码里会筛选width == SMALL_RANGE_CHECK_TABLE_WIDTH的range check，然后每两个8-bit输入组成一个lookup tuple；如果数量是奇数，就用一个空输入补齐。
+        // 这背后的工程原因是：lookup宽度固定，8-bit range check单独一列太浪费，所以两个8-bit range check可以放进同一个小range表查询里。
         let range_check_8_elements: Vec<_> = self
             .rangechecked_expressions
             .iter()
@@ -672,6 +685,7 @@ impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
             }
         }
 
+        // 第二，它把BasicAssembly内部字段拆出来，包括变量计数、constraint storage、lookup storage、boolean variables、rangechecked expressions、placeholder query、linkage queries、table driver、shuffle RAM queries、delegation requests等。
         let BasicAssembly {
             no_index_assigned,
             constraint_storage,
@@ -689,6 +703,7 @@ impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
             ..
         } = self;
 
+        // 第三，它检查delegation request和delegation processing data不能同时出现，并且delegation request最多一个。源码中有这些assert。
         if delegated_computation_requests.len() > 0 {
             assert!(degegated_request_to_process.is_none());
         }
@@ -699,6 +714,11 @@ impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
 
         assert!(delegated_computation_requests.len() <= 1);
 
+        // 源码里就是这样从BasicAssembly内部存储构造CircuitOutput。
+        // 注意：这里state_input和state_output暂时是空的。因为BasicAssembly自己不知道哪个变量是机器状态输入/输出。这个信息来自describe_state_transition返回的initial_state和final_state，所以compile_machine下一步会补进去。
+        // cs.finalize()返回的是二元组：(CircuitOutput<F>, Option<WitnessPlacer>)
+        // compile_machine只拿第一个：let (mut output, _) = cs.finalize();
+        // 第二个WitnessPlacer在这个路径里不关心，所以用_丢弃。
         let output = CircuitOutput {
             state_input: Vec::new(),
             state_output: Vec::new(),

@@ -79,13 +79,7 @@ pub struct SetupCache<A: GoodAllocator, B: GoodAllocator> {
 }
 
 impl<A: GoodAllocator, B: GoodAllocator> SetupCache<A, B> {
-    /// 获取或创建标准 main RISC-V circuit 的 setup（带缓存）。
-    ///
-    /// 需要可变 self：缓存未命中时向 main_circuit_setup 插入新项。
-    /// bytecode：RISC-V 程序机器码（按 32-bit word 存储）；&Vec<u32> 在调用
-    /// get_main_riscv_circuit_setup 时可自动转为 &[u32]。
-    ///
-    /// 返回缓存项的引用（不复制 setup 数据）；内部大对象均在 Arc 中，外部可再 Arc::clone。
+    /// 获取或创建标准 main RISC-V circuit 的 setup（带缓存）；旁支路径，Commands::Prove 主流程不经过此处。
     pub fn get_or_create_main_circuit(
         &mut self,
         bytecode: &Vec<u32>,
@@ -93,28 +87,22 @@ impl<A: GoodAllocator, B: GoodAllocator> SetupCache<A, B> {
         Arc<MainCircuitPrecomputations<IMStandardIsaConfig, A, B>>,
         Arc<Vec<Mersenne31Field, B>>,
     ) {
-        // 将 bytecode hash 为 u64，作为 HashMap 的 lazy-insert key（非安全绑定 bytecode 的承诺）。
+        // bytecode hash 作缓存 key（工程用途，非密码学绑定）。
         let mut hasher = DefaultHasher::new();
         bytecode.hash(&mut hasher);
         let hash = hasher.finish();
 
-        // 若 key 已存在则返回已有 value；否则执行闭包生成 setup 并插入（闭包仅在 miss 时运行）。
+        // 缓存命中直接返回；未命中则编译 setup 并写入 HashMap。
         self.main_circuit_setup.entry(hash).or_insert_with(|| {
-            // setup 生成含并行 FFT/LDE/表构造等，使用 8 线程 Worker（rayon 线程池）。
             let worker = worker::Worker::new_with_num_threads(8);
-            // 根据 bytecode 编译 main RISC-V 约束系统并打包为 MainCircuitPrecomputations。
             let setup = setups::get_main_riscv_circuit_setup(&bytecode, &worker);
-            // 从 SetupPrecomputations 内 row-major 的 setup trace 转置为 evaluation 向量。
+            // setup trace 转置为 evaluation 向量，供部分快速查询路径复用。
             let eval = create_circuit_setup(&setup.setup.ldes[0].trace);
             (Arc::new(setup), Arc::new(eval))
         })
     }
 
     /// 获取或创建 reduced RISC-V circuit 的 setup（与 get_or_create_main_circuit 平行）。
-    ///
-    /// 调用 setups::get_reduced_riscv_circuit_setup；机器配置为
-    /// IWithoutByteAccessIsaConfigWithDelegation，full ISA 用于 base proving，
-    /// reduced/minimal 变体用于递归层以减小证明成本。
     pub fn get_or_create_reduced_circuit(
         &mut self,
         bytecode: &Vec<u32>,

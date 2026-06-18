@@ -231,21 +231,31 @@ pub struct RegisterAndIndirectAccesses {
     pub indirect_accesses: Vec<IndirectAccessType>,
 }
 
+/// 是compiler边界前的“约束草稿”。它还没有把变量排成trace列，只是用Variable编号描述所有东西。
 pub struct CircuitOutput<F: PrimeField> {
+    /// state_input和state_output保存跨行状态变量。main RISC-V通常最核心的是pc状态。它们告诉后面的compiler：这一行的结束状态要和下一行的开始状态连接。
     pub state_input: Vec<Variable>,
+    /// state_input和state_output保存跨行状态变量。main RISC-V通常最核心的是pc状态。它们告诉后面的compiler：这一行的结束状态要和下一行的开始状态连接。
     pub state_output: Vec<Variable>,
     pub table_driver: TableDriver<F>,
     pub num_of_variables: usize,
+    /// constraints保存普通多项式约束。比如某个变量必须等于两个变量相加，某个flag必须满足布尔性，某个candidate relation必须为0。这里的Constraint<F>还基于Variable，不是最终列地址
     pub constraints: Vec<(Constraint<F>, bool)>,
+    /// lookups保存普通lookup查询。LookupQuery里有一行LookupInput和一个表类型，表类型可以是常量表，也可以由变量决定。源码中LookupQuery和LookupQueryTableType定义在Circuit文件中。
     pub lookups: Vec<LookupQuery<F>>,
+    /// shuffle_ram_queries保存RAM/register统一memory argument查询。ShuffleRamQueryType有两类：RegisterOnly和RegisterOrRam。RegisterOrRam带一个is_register布尔值和address limbs；当is_register=1时解释为寄存器访问，当is_register=0时解释为RAM访问。源码里ShuffleRamQueryType和ShuffleRamMemQuery定义在circuit.rs。
     pub shuffle_ram_queries: Vec<ShuffleRamMemQuery>,
+    /// delegated_computation_requests保存main circuit向delegation circuit发出的请求。比如某行CSR触发BLAKE2 delegation，就会产生一个request。源码里的DelegatedComputationRequest包含execute、degegation_type和memory_offset_high。
     pub delegated_computation_requests: Vec<DelegatedComputationRequest>,
     pub degegated_request_to_process: Option<DelegatedProcessingData>,
     pub batched_memory_accesses: Vec<BatchedMemoryAccessType>,
     pub register_and_indirect_memory_accesses: Vec<RegisterAndIndirectAccesses>,
     pub linked_variables: Vec<LinkedVariablesPair>,
+    /// range_check_expressions保存range check请求。比如某个表达式需要证明落在16-bit范围内，就会生成range check query。
     pub range_check_expressions: Vec<RangeCheckQuery<F>>,
+    /// boolean_vars保存必须为0/1的变量。后面compiler会为它们生成布尔约束或相关布局。
     pub boolean_vars: Vec<Variable>,
+    /// substitutions保存placeholder到变量的映射。这个后面witness generation和生成代码会用到，比如“某个公开输入位置”或“某个特殊变量”要找到对应Variable。
     pub substitutions: HashMap<(Placeholder, usize), Variable>,
 }
 

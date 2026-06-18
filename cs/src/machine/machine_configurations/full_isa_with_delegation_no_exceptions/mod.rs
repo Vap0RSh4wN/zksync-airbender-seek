@@ -11,6 +11,8 @@ type RS<F> = RegisterDecompositionWithSign<F>;
 type DE<F> = BasicDecodingResultWithSigns<F>;
 
 #[derive(Clone, Copy, Debug, Default)]
+/// full ISA加delegation CSR calls，不包含exception handling logic。
+/// 证明的是“正常执行路径”。非法opcode、未对齐访问等不会通过异常分支被证明成合法执行；更直接地说，这类行为会导致约束无法满足或程序不在支持范围里。
 pub struct FullIsaMachineWithDelegationNoExceptionHandling;
 
 impl<F: PrimeField> Machine<F> for FullIsaMachineWithDelegationNoExceptionHandling {

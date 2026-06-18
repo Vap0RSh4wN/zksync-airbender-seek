@@ -113,6 +113,7 @@ impl<F: PrimeField> AbstractMachineState<F> for Register<F> {
         REGISTER_SIZE
     }
 
+    /// 如果状态是一个Register<F>，源码里它会把两个limb变量推进dst：一个32-bit register被拆成两个16-bit变量。
     fn append_into_variables_set(&self, dst: &mut Vec<Variable>) {
         dst.push(self.0[0].get_variable());
         dst.push(self.0[1].get_variable());

@@ -81,6 +81,7 @@ pub struct CosetBoundColumnMajorTracePart<A: Allocator + Clone> {
     pub tau: Mersenne31Complex,
 }
 
+/// 保存setup trace的LDE结果和Merkle trees
 pub struct SetupPrecomputations<const N: usize, A: GoodAllocator, T: MerkleTreeConstructor> {
     pub ldes: Vec<CosetBoundTracePart<N, A>>,
     pub trees: Vec<T>,
@@ -190,6 +191,13 @@ pub struct ProverData<const N: usize, A: GoodAllocator, T: MerkleTreeConstructor
 }
 
 impl<const N: usize, A: GoodAllocator, T: MerkleTreeConstructor> SetupPrecomputations<N, A, T> {
+    // 1. 检查trace_len是2的幂。
+    // 2. 根据trace_len和LDE_FACTOR算Merkle cap大小。
+    // 3. 调用get_main_domain_trace生成setup trace。
+    // 4. 调整最后一行，使c0相关值为0。
+    // 5. 对setup trace做LDE。
+    // 6. 对每个LDE coset构造Merkle tree。
+    // 7. 返回SetupPrecomputations { ldes, trees }。
     pub fn from_tables_and_trace_len(
         table_driver: &TableDriver<Mersenne31Field>,
         trace_len: usize,
@@ -200,6 +208,7 @@ impl<const N: usize, A: GoodAllocator, T: MerkleTreeConstructor> SetupPrecomputa
         _tree_cap_size: usize,
         worker: &Worker,
     ) -> Self {
+        // 检查trace_len是2的幂
         assert!(trace_len.is_power_of_two());
 
         let optimal_folding =
@@ -207,14 +216,14 @@ impl<const N: usize, A: GoodAllocator, T: MerkleTreeConstructor> SetupPrecomputa
         let subtree_cap_size = (1 << optimal_folding.total_caps_size_log2) / lde_factor;
         assert!(subtree_cap_size > 0);
 
+        // 第一步，生成主domain上的setup trace
         let mut main_domain_trace =
             Self::get_main_domain_trace(table_driver, trace_len, setup_layout, worker);
 
-        // NOTE: we do not use last row of the setup (and in general last of of circuit),
-        // and we must adjust it to be c0 == 0
+        // 第二步，调整最后一行。不使用setup的最后一行，并且必须调整到c0 == 0。这和前面trace_len - 1作为表编码容量相呼应。
         adjust_to_zero_c0_var_length(&mut main_domain_trace, 0..setup_layout.total_width, worker);
 
-        // LDE them
+        // 第三步，做LDE
         let ldes = compute_wide_ldes(
             main_domain_trace,
             twiddles,
@@ -226,6 +235,7 @@ impl<const N: usize, A: GoodAllocator, T: MerkleTreeConstructor> SetupPrecomputa
 
         assert_eq!(ldes.len(), lde_factor);
 
+        // 第四步，为每个LDE coset构造Merkle tree
         let mut trees = Vec::with_capacity(lde_factor);
         for domain in ldes.iter() {
             let tree = T::construct_for_coset(&domain.trace, subtree_cap_size, true, worker);
@@ -235,17 +245,22 @@ impl<const N: usize, A: GoodAllocator, T: MerkleTreeConstructor> SetupPrecomputa
         Self { ldes, trees }
     }
 
+    /// 把TableDriver写入setup trace
     pub fn get_main_domain_trace(
         table_driver: &TableDriver<Mersenne31Field>,
         trace_len: usize,
         setup_layout: &SetupLayout,
         worker: &Worker,
     ) -> RowMajorTrace<Mersenne31Field, { N }, A> {
+        /// 先创建一张全零表，高度是trace_len = H，宽度是setup_layout.total_width
         let main_domain_trace =
             RowMajorTrace::new_zeroed_for_size(trace_len, setup_layout.total_width, A::default());
 
+        // 计算每组generic lookup列能放多少表行
         let table_encoding_capacity_per_tuple = trace_len - 1;
 
+        // 如果所有表总长度超过这个容量，就需要多组generic lookup columns。
+        // 源码中会根据table_driver.total_tables_len计算num_table_subsets，并要求它等于setup_layout.generic_lookup_setup_columns.num_elements()。
         let mut num_table_subsets =
             table_driver.total_tables_len / table_encoding_capacity_per_tuple;
         if table_driver.total_tables_len % table_encoding_capacity_per_tuple != 0 {
@@ -257,19 +272,24 @@ impl<const N: usize, A: GoodAllocator, T: MerkleTreeConstructor> SetupPrecomputa
             setup_layout.generic_lookup_setup_columns.num_elements()
         );
 
-        // dump tables
+        // 准备几类固定表内容
+
+        // 这一步把所有generic lookup tables表拼成统一格式的表行。每一行是宽度4：[table_col_0, table_col_1, table_col_2, table_id]
         let all_generic_tables = table_driver.dump_tables();
+        // assert拼接行数等于table_driver.total_tables_len
         assert_eq!(all_generic_tables.len(), table_driver.total_tables_len);
 
+        // 创建两个固定range表，16-bit range table，按整数范围生成field元素
         let range_check_16_table: Vec<_> = (0..(1 << 16))
             .map(|el| Mersenne31Field(el as u32))
             .collect();
-
+        // timestamp range table
         let timestamp_range_check_table: Vec<_> = (0..(1 << TIMESTAMP_COLUMNS_NUM_BITS))
             .map(|el| Mersenne31Field(el as u32))
             .collect();
 
-        // chunk generic tables encoding
+        // 把generic tables按trace_len - 1切块，每个chunk写到一组generic_lookup_setup_columns里。
+        // 源码里也检查chunk数量和setup layout里的元素数量一致。
         let generic_tables_chunks: Vec<_> = all_generic_tables
             .chunks(table_encoding_capacity_per_tuple)
             .collect();
@@ -286,6 +306,7 @@ impl<const N: usize, A: GoodAllocator, T: MerkleTreeConstructor> SetupPrecomputa
 
         let all_generic_tables_ref = &generic_tables_chunks;
 
+        // 按行填setup trace，进入worker并行写每一行。对每个absolute_row_idx：
         worker.scope(trace_len - 1, |scope, geometry| {
             for thread_idx in 0..geometry.len() {
                 let chunk_size = geometry.get_chunk_size(thread_idx);
@@ -300,17 +321,21 @@ impl<const N: usize, A: GoodAllocator, T: MerkleTreeConstructor> SetupPrecomputa
 
                         let trace_view_row = trace_view.current_row();
 
+                        // 如果当前行号小于2^16，写入16-bit range table：
                         if absolute_row_idx < range_check_16_table_content_len {
                             trace_view_row[setup_layout.range_check_16_setup_column.start()] =
                                 range_check_16_table_content_ref[absolute_row_idx];
                         }
 
+                        // 如果当前行号小于timestamp range表长度，写timestamp range table
                         if absolute_row_idx < timestamp_range_check_table_content_len {
                             trace_view_row
                                 [setup_layout.timestamp_range_check_setup_column.start()] =
                                 timestamp_range_check_table_content_ref[absolute_row_idx];
                         }
 
+                        // 对每个generic table chunk，如果当前行号还在chunk范围内，就取出一行table row，并写入对应的generic lookup columns：
+                        // 把拼好的lookup表内容分块写进generic_lookup_setup_columns，每一块最多写trace_len - 1行，因为最后一行不用。
                         for (tuple_idx, encoding_chunk) in all_generic_tables_ref.iter().enumerate()
                         {
                             if absolute_row_idx < encoding_chunk.len() {
@@ -322,6 +347,8 @@ impl<const N: usize, A: GoodAllocator, T: MerkleTreeConstructor> SetupPrecomputa
                             }
                         }
 
+                        // 如果setup layout里有timestamp setup columns，还写timestamp：
+                        // 这些timestamp列服务shuffle RAM argument。
                         if setup_layout.timestamp_setup_columns.num_elements() > 0 {
                             let timestamp = (absolute_row_idx as u64) + 1;
                             let timestamp_shifted = timestamp << NUM_EMPTY_BITS_FOR_RAM_TIMESTAMP;

@@ -884,15 +884,24 @@ impl quote::ToTokens for BoundaryConstraintLocation {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CompiledCircuitArtifact<F: PrimeField> {
+    /// witness_layout告诉witness trace怎么排。后面witness evaluator根据执行轨迹，把pc、opcode flags、寄存器值、RAM访问值等写到对应列。
     pub witness_layout: WitnessSubtree<F>,
+    /// memory_layout告诉shuffle RAM相关列怎么排。因为register和RAM访问都走memory argument，所以这部分很重要。
     pub memory_layout: MemorySubtree,
+    /// setup_layout就是刚才讲的固定列布局，诉我们setup trace有多少列、每类固定列放在哪里。后面SetupPrecomputations会用它写setup trace。
     pub setup_layout: SetupLayout,
+    /// stage_2_layout服务lookup和memory argument后续阶段。Airbender prover不是只有stage 1 witness，它还有stage 2 lookup/memory argument相关数据。
     pub stage_2_layout: LookupAndMemoryArgumentLayout,
+    /// degree_1_constraints和degree_2_constraints是编译后的普通约束。它们已经不再用Variable，而是用ColumnAddress。
+    /// 后端评价时直接从row里按地址取值。源码里CompiledDegree1Constraint和CompiledDegree2Constraint都有evaluate_at_row...方法，
+    /// 接收witness_row、memory_row，某些版本还接收setup_row。这说明编译后的约束已经面向具体列布局。
     pub degree_2_constraints: Vec<CompiledDegree2Constraint<F>>,
     pub degree_1_constraints: Vec<CompiledDegree1Constraint<F>>,
+    /// state_linkage_constraints保存相邻行状态连接。比如上一行的final pc要接到下一行的initial pc。具体连接哪些变量由state_input和state_output经过compiler处理产生。
     pub state_linkage_constraints: Vec<(ColumnAddress, ColumnAddress)>,
+    /// 告诉proof哪些边界位置的列值是公开输入。比如最终pc、某些end params相关值会进入外部验证。
     pub public_inputs: Vec<(BoundaryConstraintLocation, ColumnAddress)>,
-
+    /// variable_mapping保存原始Variable -> ColumnAddress的映射。witness generation需要它，因为Machine写约束时产生的是Variable，真正填trace时必须知道Variable对应哪一列。
     pub variable_mapping: BTreeMap<Variable, ColumnAddress>,
 
     pub scratch_space_size_for_witness_gen: usize,
@@ -904,8 +913,9 @@ pub struct CompiledCircuitArtifact<F: PrimeField> {
     pub batched_memory_access_timestamp_comparison_aux_vars: BatchedRamTimestampComparisonAuxVars,
     pub register_and_indirect_access_timestamp_comparison_aux_vars:
         RegisterAndIndirectAccessTimestampComparisonAuxVars,
-
+    /// trace_len就是H = 2^22。
     pub trace_len: usize,
+    /// table_offsets和total_tables_size服务lookup表拼接后的偏移。因为TableDriver把很多表拼到generic setup里，后面需要知道某张表从拼接后的哪个offset开始。
     pub table_offsets: Vec<u32>,
     pub total_tables_size: usize,
 }

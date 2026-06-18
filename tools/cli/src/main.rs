@@ -1,3 +1,15 @@
+//! Airbender CLI 可执行入口（cargo run -p cli -- 子命令）。
+//!
+//! 本文件只负责解析命令行参数，并把证明、验证、运行等具体工作分发给 cli_lib 下的模块。
+//! 它本身不直接编译约束系统，也不调用 get_main_riscv_circuit_setup。
+//!
+//! 第二章主线（从 prove 到 main RISC-V setup）在此处的分界是：
+//! CLI argv -> Cli::parse() -> Commands::Prove
+//!   -> fetch_input_data(input)
+//!   -> create_proofs(...)   // 见 prover_utils.rs
+//!
+//! tools/cli/src/setup.rs 中的 SetupCache 是旁支缓存封装，当前 Commands::Prove 主路径不经过它。
+
 #![feature(allocator_api)]
 #![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
@@ -5,12 +17,19 @@
 use base64::Engine;
 use blake2s_u32::Blake2sState;
 use clap::{Parser, Subcommand};
+// 证明相关逻辑集中在 prover_utils.rs；main.rs 只导入并调用，不内联实现证明。
+// create_proofs：CLI prove 的第一层封装，加载 binary、计算 instance 数、选择 CPU/GPU 路径。
+// create_final_proofs_from_program_proof：ProveFinal 子命令用。
+// generate_oracle_data_from_metadata / serialize_to_file / u32_from_hex_string：验证与序列化辅助。
+// ProvingLimit / DEFAULT_CYCLES：递归停止条件与默认 cycle 上限（32_000_000）。
 use cli_lib::prover_utils::{
     create_final_proofs_from_program_proof, create_proofs, generate_oracle_data_from_metadata,
     serialize_to_file, u32_from_hex_string, ProvingLimit, DEFAULT_CYCLES,
 };
 
 use cli_lib::vk::generate_vk;
+// Machine：决定 create_proofs_internal 进入 Standard / Reduced / ReducedLog23 哪条分支。
+// Standard 用于 base proving（full ISA main RISC-V）；Reduced 系列主要用于递归层。
 use execution_utils::{
     generate_constants_for_binary, Machine, ProgramProof, RecursionStrategy,
     VerifierCircuitsIdentifiers,
@@ -59,55 +78,63 @@ impl Default for InputType {
 
 #[derive(Clone, Debug, Parser, Default)]
 struct InputConfig {
-    // Either load data from the input file
+    /// 从本地文件读取非确定输入（与 input_rpc 二选一）。
     #[arg(long)]
     input_file: Option<String>,
 
-    /// Type of input - hex string or prover_input json (only for input_file).
+    /// 输入编码方式：Hex 为连续 hex 字符串；ProverInputJson 从 JSON 的 prover_input 字段读取（仅配合 input_file）。
     #[arg(long, value_enum, default_value = "hex")]
     input_type: InputType,
 
-    // Loads data from the RPC - if set, you also have to set input_batch
+    /// 从 JSON-RPC URL 拉取输入（需同时设置 input_batch）。
     #[arg(long)]
     input_rpc: Option<String>,
+    /// 配合 input_rpc 使用的批次号，用于拼接下载 URL。
     #[arg(long)]
     input_batch: Option<u64>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// 证明一条 RISC-V 程序执行轨迹（第二章主线入口）。
+    ///
+    /// CLI 在此处分界：解析参数后调用 create_proofs，不直接编译约束系统。
     Prove {
-        /// Path to binary
+        /// 待证明的 RISC-V binary 文件路径；后续会 pad 成固定 ROM 大小的 Vec<u32>。
         #[arg(short, long)]
         bin: String,
-        // Either load data from the input file or from RPC
+        /// 非确定输入：可来自文件或 RPC（hex 或 JSON prover_input），供 guest 通过 oracle 读取。
         #[clap(flatten)]
         input: InputConfig,
+        /// 证明产物输出目录。
         #[arg(long, default_value = "output")]
         output_dir: String,
 
+        /// 最终 program proof 的文件名（用于 until=final-proof 等场景）。
         #[arg(long, default_value = "final_program_proof.json")]
         final_proof_name: String,
 
+        /// 机器类型，默认 standard，对应 Machine::Standard 与 main RISC-V base proving。
         #[arg(long, value_enum, default_value = "standard")]
         machine: Machine,
-        // If proving for recursion - you must also pass the previous metadata info.
+        /// 递归证明时传入的上一段 metadata 路径；base proving 通常不传。
         #[arg(long)]
         prev_metadata: Option<String>,
-        /// Number of riscV cycles to run. 32_000_000 if not set.
+        /// 最多执行的 RISC-V cycle 数，默认 DEFAULT_CYCLES（32_000_000）。
         #[arg(long)]
         cycles: Option<usize>,
 
-        /// If set, run the recursion, until a given moment.
+        /// 若设置，在 base proving 后继续跑递归，直到指定阶段（FinalRecursion / FinalProof / Snark）。
         #[arg(long)]
         until: Option<ProvingLimit>,
+        /// 递归层使用的机器策略（如 use-reduced-log23-machine）。
         #[arg(long, value_enum, default_value = "use-reduced-log23-machine")]
         mode: RecursionStrategy,
 
-        /// If set, the temporary data (e.g. intermediate proofs) will be stored in the given directory.
+        /// 中间证明与 metadata 的临时目录（递归路径可选）。
         #[arg(long)]
         tmp_dir: Option<String>,
-        /// If true, use GPU for proving.
+        /// 为 true 时走 GPU proving，会绕开 CPU 路径里对 get_main_riscv_circuit_setup 的直接调用。
         #[arg(long)]
         gpu: bool,
     },
@@ -229,12 +256,16 @@ fn fetch_data_from_url(url: &str) -> Result<Option<String>, reqwest::Error> {
     Ok(Some(response))
 }
 
+// 读取 Prove / Run 的外部输入，返回 Option<Vec<u32>>；无输入源时返回 None。
+// 下游：create_proofs 中变为 non_determinism_data，再进入 QuasiUARTSource.oracle。
 fn fetch_input_data(input: &InputConfig) -> Result<Option<Vec<u32>>, reqwest::Error> {
+    // 按 input_file 或 input_rpc 选择数据来源，并带上对应的 input_type。
     let (data, input_type) = if let Some(input_file) = &input.input_file {
         (
             Some(fs::read_to_string(input_file).unwrap().trim().to_string()),
             input.input_type.clone(),
         )
+    // RPC 路径固定按 ProverInputJson 解析。
     } else if let Some(url) = &input.input_rpc {
         (fetch_data_from_json_rpc(&url)?, InputType::ProverInputJson)
     } else {
@@ -242,17 +273,19 @@ fn fetch_input_data(input: &InputConfig) -> Result<Option<Vec<u32>>, reqwest::Er
     };
 
     match input_type {
+        // Hex：每 8 个十六进制字符解析为一个 u32。
         InputType::Hex => Ok(data.map(|d| u32_from_hex_string(&d))),
         InputType::ProverInputJson => {
             if let Some(data) = data {
-                // decode data as Json and then get the 'prover_input' field
                 let json: Value = serde_json::from_str(&data).expect("Failed to parse JSON");
+                // JSON 中 prover_input 字段，通常为 base64 编码的字节串。
                 let prover_input = json["prover_input"].as_str().unwrap_or_default();
 
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(&prover_input)
                     .expect("Failed to decode base64 input");
 
+                // 按 4 字节小端切成 u32，与 guest 读 oracle 时的字序一致。
                 let prover_input: Vec<u32> = decoded
                     .chunks_exact(4)
                     .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
@@ -289,19 +322,21 @@ fn main() {
     let cli = Cli::parse();
     match &cli.command {
         Commands::Prove {
-            bin,
-            input,
+            bin,             // 要证明的RISC-V binary
+            input,           // 非确定输入，可以来自文件或RPC
             output_dir,
             final_proof_name,
-            machine,
+            machine,         // 选择机器类型，默认是standard
             prev_metadata,
-            cycles,
-            until,
-            mode,
-            tmp_dir,
-            gpu,
+            cycles,          // 控制最多跑多少RISC-V cycles
+            until,           // 主要和递归证明相关
+            mode,            // 主要和递归证明相关
+            tmp_dir,         // 主要和递归证明相关
+            gpu,             // 决定走CPU还是GPU proving路径
         } => {
+            // 第二章 2.2：把 CLI input 转成 Vec<u32> 非确定输入。
             let input_data = fetch_input_data(input).expect("Failed to fetch");
+            // 第二章 2.3：进入 prove 第一层封装；不直接调用 get_main_riscv_circuit_setup。
             create_proofs(
                 bin,
                 output_dir,
@@ -365,7 +400,7 @@ fn main() {
                 panic!("Not enabled - please compile with `include_verifiers` feature.")
             }
         }
-        Commands::Run {
+        Commands::Run {//run 只验证程序语义，不生成 proof，不调用 get_main_riscv_circuit_setup。
             bin,
             cycles,
             input,
@@ -658,6 +693,8 @@ fn u32_to_file(output_file: &String, numbers: &[u32]) {
     println!("Successfully wrote to file: {}", output_file);
 }
 
+// 运行RISC-V binary，并返回最终寄存器值和是否执行到结束点
+// 只验证程序语义，不生成 proof，不调用 get_main_riscv_circuit_setup。
 fn run_binary(
     bin_path: &String,
     cycles: &Option<usize>,
@@ -665,12 +702,18 @@ fn run_binary(
     expected_results: &Option<Vec<u32>>,
     machine: &Machine,
 ) {
+    // SimulatorConfig {
+    //     bin: Path(app.bin),
+    //     cycles: DEFAULT_CYCLES = 32_000_000,
+    //     entry_point: 0,
+    //   }
     let config = SimulatorConfig {
         bin: prover::risc_v_simulator::sim::BinarySource::Path(bin_path.into()),
         cycles: cycles.unwrap_or(DEFAULT_CYCLES),
         entry_point: 0,
         diagnostics: None,
     };
+    // 因为 input_data = None，所以 oracle 队列为空
     let mut non_determinism_source = QuasiUARTSource::default();
     if let Some(input_data) = input_data {
         for entry in input_data {
@@ -678,6 +721,9 @@ fn run_binary(
         }
     }
 
+    // 输出：
+    // registers: 模拟器最终寄存器
+    // reached_end: 是否执行到 zksync_os_finish_success / 结束点
     let (registers, reached_end) = match machine {
         Machine::Standard => {
             let result = run_simple_with_entry_point_and_non_determimism_source_for_config::<

@@ -31,6 +31,7 @@ pub mod types;
 pub mod utils;
 
 #[cfg(feature = "compiler")]
+/// 接收四个东西：machine定义、RomRead表、可选CSR表、trace长度log2
 pub fn default_compile_machine<
     M: crate::machine::Machine<::field::Mersenne31Field>,
     const ROM_ADDRESS_SPACE_SECOND_WORD_BITS: usize,
@@ -53,24 +54,30 @@ where
     use crate::one_row_compiler::OneRowCompiler;
     use crate::tables::TableType;
 
+    // 把Machine写入BasicAssembly，得到CircuitOutput。你可以先把BasicAssembly理解为约束记录器。
+    // Machine代码调用它来申请变量、加约束、加lookup、加memory query，最后finalize成CircuitOutput。
     let mut cs_output = compile_machine::<
         Mersenne31Field,
+        // 用BasicAssembly作为Circuit实现，运行machine的describe_state_transition。
         BasicAssembly<Mersenne31Field>,
         M,
         ROM_ADDRESS_SPACE_SECOND_WORD_BITS,
     >(machine);
-    // add the ROM table to account for size
+    // 函数第二步把RomRead表塞进cs_output.table_driver
     cs_output.table_driver.add_table_with_content(
         TableType::RomRead,
         crate::tables::LookupWrapper::Dimensional3(bytecode_table),
     );
+    // 第三步如果有CSR表，也塞进去
     if let Some(csr_table) = csr_table {
         cs_output.table_driver.add_table_with_content(
             TableType::SpecialCSRProperties,
             crate::tables::LookupWrapper::Dimensional3(csr_table),
         );
     }
+    // 把CircuitOutput编译成CompiledCircuitArtifact。源码里default_compile_machine最后返回compiler_output。
     let compiler = OneRowCompiler::default();
+    // 把CircuitOutput送进OneRowCompiler，得到最终CompiledCircuitArtifact。
     let compiler_output =
         compiler.compile_output_for_chunked_memory_argument(cs_output, trace_len_log2);
 

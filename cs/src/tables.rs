@@ -53,15 +53,16 @@ pub struct LookupTable<F: PrimeField, const N: usize> {
     pub name: String,
 
     // NOTE: for small fields and not too large N hashmaps are the most efficient here
-
-    // to lookup value from key
+    /// lookup_data用于从key查value
     #[derivative(Debug = "ignore")]
     pub lookup_data: Arc<HashMap<LookupKey<F, N>, LookupValue<F, N>>>,
     // to lookup table index from full row
     #[derivative(Debug = "ignore")]
+    /// 从完整row查table index
     pub content_data: Arc<HashMap<DataKey<F, N>, usize>>,
     // for setup - plain content of the table
     #[derivative(Debug = "ignore")]
+    /// 这是setup阶段要dump出来的真实表内容
     pub data: Arc<Vec<[F; N]>>,
     #[derivative(Debug = "ignore")]
     pub quick_value_lookup_fn: ValueLookupFn<F, N>,
@@ -531,6 +532,7 @@ impl<F: PrimeField, const N: usize> LookupTable<F, N> {
 }
 
 #[derive(Clone, Debug)]
+/// LookupWrapper是因为不同表宽度不同。有的表宽度1，有的2，有的3。Rust类型上LookupTable<F, 1>和LookupTable<F, 3>不是同一个类型，所以用枚举包起来
 pub enum LookupWrapper<F: PrimeField> {
     Uninitialized,
     Dimensional1(LookupTable<F, 1>),
@@ -719,6 +721,7 @@ impl TableType {
 }
 
 impl TableType {
+    /// 按TableType生成真实表
     pub fn generate_table<F: PrimeField>(self) -> LookupWrapper<F> {
         let id = self.to_table_id();
         match self {
@@ -936,9 +939,20 @@ pub fn create_xor_table<F: PrimeField, const WIDTH: usize>(id: u32) -> LookupTab
     )
 }
 
+/// 生成ADD表，会枚举所有8-bit输入对a,b，然后生成a & b的结果
+/// 已经包含所有：
+/// a   b   a & b
+/// 0   0   0
+/// 0   1   0
+/// ...
+/// 255 255 255
+/// 这类真实表行。
 pub fn create_and_table<F: PrimeField>(id: u32) -> LookupTable<F, 3> {
+    // key_binary_generation()会生成所有0..255和0..255的组合。
     let keys = key_binary_generation();
     const TABLE_NAME: &'static str = "AND table";
+    // 创建表时，create_table_from_key_and_pure_generation_fn会遍历所有key，调用生成函数得到value，
+    // 然后把完整row push进content，最后计算lookup cache并保存到data字段里。
     LookupTable::create_table_from_key_and_pure_generation_fn(
         &keys,
         TABLE_NAME.to_string(),
@@ -1420,6 +1434,7 @@ pub fn create_rom_separator_table<
 }
 
 // we make it so that index in the table is just (key0 << 8) || key1
+/// 生成所有0..255和0..255的组合
 pub fn key_binary_generation<F: PrimeField, const N: usize>() -> Vec<[F; N]> {
     let mut keys = Vec::with_capacity(1 << 16);
     for a in 0..(1u64 << 8) {
@@ -1996,6 +2011,8 @@ pub const TABLE_TYPES_UPPER_BOUNDS: usize = const {
 };
 
 /// Manages multiple lookup tables.
+/// TableDriver则是一整个表集合。它用TableType作为槽位，把所有表放在一起。
+/// 后面dump_tables会把这些表统一拼成Vec<[F; 4]>：前3列是表行内容，第4列是table id。这样setup trace可以用统一宽度编码所有generic lookup表。
 #[derive(Clone, Debug)]
 pub struct TableDriver<F: PrimeField> {
     pub tables: [LookupWrapper<F>; TABLE_TYPES_UPPER_BOUNDS],
@@ -2025,6 +2042,8 @@ impl<F: PrimeField> TableDriver<F> {
         assert_eq!(offset, self.total_tables_len);
     }
 
+    /// 这个函数会检查table id和table type一致。如果这张表已经初始化，就直接返回；
+    /// 否则把表放到self.tables[id]，增加total_tables_len，并重新计算每张表在拼接总表中的offset。
     pub fn add_table_with_content(&mut self, table_type: TableType, table: LookupWrapper<F>) {
         let id = table.get_table_id() as usize;
         assert_eq!(id, table_type.to_table_id() as usize);
@@ -2037,8 +2056,27 @@ impl<F: PrimeField> TableDriver<F> {
         self.total_tables_len += table_size;
         self.update_table_offsets();
     }
-
+    /// 在cache里没有这张表时，调用table_type.generate_table::<F>()真正生成表。
+    /// 然后再调用self.add_table_with_content(table_type, table)把生成好的表放进当前TableDriver。
+    /// 标准表是这样生成的：
+    /// TableType::And
+    /// -> generate_table()
+    ///   -> create_and_table()
+    ///     -> 枚举所有key
+    ///     -> 计算每个key对应的value
+    ///     -> 保存成LookupTable.data
+    ///     -> 保存lookup_data / content_data
+    /// -> add_table_with_content()
+    ///   -> 放进TableDriver.tables[id]
     pub fn materialize_table(&mut self, table_type: TableType) {
+        // materialize_table(TableType::And)
+        // =
+        // 如果全局cache里没有And表：
+        //     生成And表的真实内容
+        // 否则：
+        //     从cache里clone一份And表
+        // 然后：
+        //    add_table_with_content到这个TableDriver里
         static CACHE: LazyLock<Mutex<TypeMap>> = LazyLock::new(|| Mutex::new(TypeMap::default()));
         let mut guard = CACHE.lock().unwrap();
         let map = guard
@@ -2048,6 +2086,8 @@ impl<F: PrimeField> TableDriver<F> {
             .entry(table_type)
             .or_insert_with(|| table_type.generate_table::<F>());
         let table = wrapper.clone();
+        // 这个函数会检查table id和table type一致。如果这张表已经初始化，就直接返回；
+        // 否则把表放到self.tables[id]，增加total_tables_len，并重新计算每张表在拼接总表中的offset。
         self.add_table_with_content(table_type, table);
     }
 

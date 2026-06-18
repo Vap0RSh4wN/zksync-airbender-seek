@@ -1,3 +1,17 @@
+//! 证明流程的第一层与第二层封装（第二章 2.3–2.6 节）。
+//!
+//! 调用链：
+//! create_proofs
+//!   -> load_binary_from_path / get_padded_binary
+//!   -> create_proofs_internal
+//!        Machine::Standard + CPU:
+//!          get_main_riscv_circuit_setup
+//!          all_delegation_circuits_precomputations
+//!          prove_image_execution
+//!
+//! 当前 CPU base proving 在 Machine::Standard 分支里直接调用 get_main_riscv_circuit_setup，
+//! 不经过 tools/cli/src/setup.rs 的 SetupCache。
+
 use clap::ValueEnum;
 use execution_utils::Machine;
 use execution_utils::{
@@ -26,7 +40,8 @@ pub fn serialize_to_file<T: serde::Serialize>(el: &T, filename: &Path) {
     serde_json::to_writer_pretty(&mut dst, el).unwrap();
 }
 
-/// Default amount of cycles, if no flag is set.
+/// 未指定 --cycles 时使用的默认 RISC-V 执行 cycle 上限。
+/// 与 risc_v_cycles::NUM_CYCLES（每个 proof instance 约 2^22 - 1 cycles）一起决定 num_instances。
 pub const DEFAULT_CYCLES: usize = 32_000_000;
 
 // Determines when to stop proving.
@@ -58,6 +73,7 @@ pub fn u32_from_hex_string(hex_string: &str) -> Vec<u32> {
     numbers
 }
 
+// CLI prove 的第一层封装（第二章 2.3）；不编译约束，最终进入 create_proofs_internal。
 pub fn create_proofs(
     bin_path: &String,
     output_dir: &String,
@@ -71,12 +87,16 @@ pub fn create_proofs(
     tmp_dir: &Option<String>,
     use_gpu: bool,
 ) {
+    // 递归场景：从文件反序列化上一段 ProofMetadata。
     let prev_metadata: Option<ProofMetadata> = prev_metadata
         .as_ref()
         .map(|prev_metadata| deserialize_from_file(&prev_metadata));
 
+    // 读 binary 并 pad 到 MAX_ROM_SIZE/4（2^19 个 u32 word），供 ROM table 与 get_machine 使用。
     let binary = load_binary_from_path(bin_path);
 
+    // 每个 instance 约 NUM_CYCLES = 2^22 - 1 cycles；据此估算最多需要多少个 main circuit proof。
+    // 这里的 num_instances 是上限，不等于最终一定生成 8 个 proof。比如basic_fibonacci 很短，通常只需要 1 个 basic proof。
     let num_instances = (cycles.unwrap_or(DEFAULT_CYCLES) / risc_v_cycles::NUM_CYCLES) + 1;
 
     println!(
@@ -84,14 +104,10 @@ pub fn create_proofs(
         num_instances
     );
 
+    // 无 CLI 输入时用空 Vec；后续填入 QuasiUARTSource 作为 guest 非确定输入 oracle。
     let non_determinism_data = input_data.unwrap_or_default();
 
-    // Serialization and deserialization of artifacts
-    // (as requested by user arguments) can take a lot of time,
-    // and typically won't be needed in production.
-    // total_proof_time accumulates the actual time spent on
-    // the production critical path
-    // (tracing, witness generation, proving, recursion).
+    // use_gpu 为 true 时创建 GpuSharedState，GPU 路径绕开 CPU 的 get_main_riscv_circuit_setup。
     let (mut gpu_state, mut total_proof_time) = if use_gpu {
         // In this function we only use the GPU for the base and 1st recursion layer (reduced 2^22 machine).
         // In order to use it for the 2nd recursion layer, you should call `create_final_proofs_from_program_proof`
@@ -112,6 +128,7 @@ pub fn create_proofs(
     };
     let mut gpu_state = gpu_state.as_mut();
 
+    // 第二章 2.4：按 machine 分支选择 setup 与 prove_image_execution。
     let (proof_list, proof_metadata) = create_proofs_internal(
         &binary,
         non_determinism_data,
@@ -199,10 +216,12 @@ pub fn create_proofs(
     }
 }
 
+// 读磁盘 binary，经 get_padded_binary 切成 u32 并 pad 到 MAX_ROM_SIZE / 4。
 pub fn load_binary_from_path(path: &String) -> Vec<u32> {
     let mut file = std::fs::File::open(path).expect("must open provided file");
     let mut buffer = vec![];
     file.read_to_end(&mut buffer).expect("must read the file");
+    // execution_utils：4 字节小端切 word + pad_bytecode_for_proving。
     get_padded_binary(&buffer)
 }
 
@@ -258,6 +277,7 @@ impl<'a> GpuSharedState<'a> {
     }
 }
 
+// 证明第二层封装（第二章 2.4–2.6）；Machine::Standard CPU 路径调用 get_main_riscv_circuit_setup。
 pub fn create_proofs_internal(
     binary: &Vec<u32>,
     non_determinism_data: Vec<u32>,
@@ -267,8 +287,10 @@ pub fn create_proofs_internal(
     gpu_shared_state: &mut Option<&mut GpuSharedState>,
     total_proof_time: &mut Option<f64>,
 ) -> (ProofList, ProofMetadata) {
+    // 供 setup 预计算（twiddles、LDE、SetupPrecomputations）使用的并行 worker。
     let worker = worker::Worker::new();
 
+    // 非确定输入抽象为 UART-like oracle；guest 读外部数据时从此队列取 u32。
     let mut non_determinism_source = QuasiUARTSource::default();
 
     for entry in non_determinism_data {
@@ -309,11 +331,17 @@ pub fn create_proofs_internal(
                         panic!("GPU not enabled - please compile with --features gpu flag.")
                     }
                 } else {
+                    // 第二章 2.5：CPU base proving 真实调用 main RISC-V setup 的位置。
+                    // main setup和delegation setup都必须早于prove_image_execution创建。main_circuit_precomputations依赖binary，因为ROM表必须由当前program bytecode生成。
                     let main_circuit_precomputations =
                         setups::get_main_riscv_circuit_setup::<Global, Global>(&binary, &worker);
+                    // BLAKE2、BigInt 等 delegation circuit 的预计算（非 main machine 本体）。
+                    // delegation_precomputations不依赖binary，只依赖delegation circuit定义和worker。
                     let delegation_precomputations =
                         setups::all_delegation_circuits_precomputations::<Global, Global>(&worker);
 
+                    // 执行程序、生成 witness、产出 proof（setup 结果在此被消费）。
+                    // prove_image_execution同时需要binary、非确定输入、main setup和delegation setup，才能执行VM、生成main witness、收集delegation witness并产生proof。
                     prover_examples::prove_image_execution(
                         num_instances,
                         &binary,
@@ -325,6 +353,9 @@ pub fn create_proofs_internal(
                 };
 
             (
+                // Machine::Standard分支随后把basic_proofs和delegation_proofs放进ProofList。
+                // reduced_proofs和reduced_log_23_proofs保持空数组，因为base proving还没有进入递归压缩机器。
+                // register_values会进入ProofMetadata，CLI后续序列化metadata时使用它记录guest执行结束后的寄存器状态。
                 ProofList {
                     basic_proofs,
                     reduced_proofs: vec![],
@@ -335,6 +366,7 @@ pub fn create_proofs_internal(
             )
         }
         Machine::Reduced => {
+            // 递归层常用 reduced machine；调用 get_reduced_riscv_circuit_setup（第二章 2.6 旁支）。
             let (reduced_proofs, delegation_proofs, register_values) =
                 if let Some(gpu_shared_state) = gpu_shared_state {
                     #[cfg(feature = "gpu")]
@@ -390,6 +422,7 @@ pub fn create_proofs_internal(
             )
         }
         Machine::ReducedLog23 => {
+            // 更小 trace domain 的 reduced machine（2^23 行量级）；第二章主线可先略读。
             let (reduced_log_23_proofs, delegation_proofs, register_values) =
                 if let Some(gpu_shared_state) = gpu_shared_state {
                     #[cfg(feature = "gpu")]
