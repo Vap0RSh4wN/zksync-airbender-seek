@@ -131,6 +131,13 @@ impl TimestampData {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// 电路构造阶段的变量编号。
+///
+/// Variable只表示“这是第几个临时变量”，不表示trace里的列号，也不表示执行时的具体值。
+/// Machine代码先用BasicAssembly::add_variable顺序分配Variable，OneRowCompiler后面再把Variable映射到具体ColumnAddress。
+///
+/// 第四章里的ADD例子中，rs1_low、rs2_low、rd_low、is_add都会先表现成Variable。
+/// 第五章的witness generation才给这些Variable填写真实执行值。
 pub struct Variable(pub u64);
 
 impl Ord for Variable {
@@ -146,10 +153,15 @@ impl PartialOrd for Variable {
 }
 
 impl Variable {
+    /// 返回占位变量u64::MAX。
+    ///
+    /// 一些中间结构需要先放一个“还没有真正绑定”的Variable槽位，
+    /// 这里使用u64::MAX作为特殊标记值。
     pub const fn placeholder_variable() -> Self {
         Self(u64::MAX)
     }
 
+    /// 判断当前Variable是否只是占位符。
     pub const fn is_placeholder(&self) -> bool {
         self.0 == u64::MAX
     }

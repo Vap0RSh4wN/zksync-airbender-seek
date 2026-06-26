@@ -53,25 +53,29 @@ pub struct LookupTable<F: PrimeField, const N: usize> {
     pub name: String,
 
     // NOTE: for small fields and not too large N hashmaps are the most efficient here
-    /// lookup_data用于从key查value
+    /// lookup_data用于从key查value， key -> value的hashmap。查表输出时使用。
     #[derivative(Debug = "ignore")]
     pub lookup_data: Arc<HashMap<LookupKey<F, N>, LookupValue<F, N>>>,
     // to lookup table index from full row
     #[derivative(Debug = "ignore")]
-    /// 从完整row查table index
+    /// 从完整row查table index，full row -> row index的hashmap。检查某一整行属于表时使用。
     pub content_data: Arc<HashMap<DataKey<F, N>, usize>>,
     // for setup - plain content of the table
     #[derivative(Debug = "ignore")]
+    /// 表的每一行真实内容。setup trace生成时会dump这里。
     /// 这是setup阶段要dump出来的真实表内容
     pub data: Arc<Vec<[F; N]>>,
     #[derivative(Debug = "ignore")]
+    /// 快速根据key算value的函数
     pub quick_value_lookup_fn: ValueLookupFn<F, N>,
     #[derivative(Debug = "ignore")]
+    /// 快速根据row算index的函数。
     pub quick_index_lookup_fn: IndexLookupFn<F, N>,
-
+    /// 前几列作为key
     pub num_key_columns: usize,
+    /// 后几列作为value
     pub num_value_columns: usize,
-
+    /// TableType对应的table id。
     pub id: u32,
 }
 
@@ -184,6 +188,7 @@ impl<F: PrimeField, const N: usize> LookupTable<F, N> {
         self.content_data.len()
     }
 
+    /// 把每个key转换成row，填入content，随后调用compute_default_lookup_impls构造缓存，最后把content放进data: Arc<Vec<[F; N]>>。
     pub(crate) fn create_table_from_key_and_pure_generation_fn(
         keys: &Vec<[F; N]>,
         name: String,
@@ -2045,15 +2050,19 @@ impl<F: PrimeField> TableDriver<F> {
     /// 这个函数会检查table id和table type一致。如果这张表已经初始化，就直接返回；
     /// 否则把表放到self.tables[id]，增加total_tables_len，并重新计算每张表在拼接总表中的offset。
     pub fn add_table_with_content(&mut self, table_type: TableType, table: LookupWrapper<F>) {
+        // 1. 检查传入table的id等于table_type对应的id。
         let id = table.get_table_id() as usize;
         assert_eq!(id, table_type.to_table_id() as usize);
+        // 2. 找到tables[table_id]这个槽位。
         if self.tables[id].is_initialized() {
             // duplicate init, fine
             return;
         }
+        // 3. 如果槽位还没有初始化，把table写进去。
         let table_size = table.get_size();
         self.tables[id] = table;
         self.total_tables_len += table_size;
+        // 4. 更新total_tables_len和offsets_for_multiplicities。
         self.update_table_offsets();
     }
     /// 在cache里没有这张表时，调用table_type.generate_table::<F>()真正生成表。
@@ -2078,13 +2087,18 @@ impl<F: PrimeField> TableDriver<F> {
         // 然后：
         //    add_table_with_content到这个TableDriver里
         static CACHE: LazyLock<Mutex<TypeMap>> = LazyLock::new(|| Mutex::new(TypeMap::default()));
+        // 拿到缓存锁。
         let mut guard = CACHE.lock().unwrap();
+        // TypeMap按类型区分缓存。这里为当前字段类型F创建或取得HashMap<TableType, LookupWrapper<F>>。
         let map = guard
             .entry()
             .or_insert_with(HashMap::<TableType, LookupWrapper<F>>::new);
+        // 如果缓存里已有这张表，直接用已有LookupWrapper。
+        // 如果缓存里没有，调用table_type.generate_table::<F>()生成。
         let wrapper = map
             .entry(table_type)
             .or_insert_with(|| table_type.generate_table::<F>());
+        // 克隆LookupWrapper。LookupTable内部用Arc保存data和hashmap，克隆通常共享底层表内容。
         let table = wrapper.clone();
         // 这个函数会检查table id和table type一致。如果这张表已经初始化，就直接返回；
         // 否则把表放到self.tables[id]，增加total_tables_len，并重新计算每张表在拼接总表中的offset。

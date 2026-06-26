@@ -58,11 +58,11 @@ pub fn create_special_csr_properties_table<F: PrimeField>(
             // 也就是说，CSR编号0x7c0被Airbender用作non-determinism输入入口。
             // 它的作用可以先理解成：guest程序通过这个CSR从外部输入源读数据。
             // 比如dynamic_fibonacci这种程序，n不是写死在程序binary里的，而是从输入里传进来。执行时，程序可能通过某个CSR读取这个非确定输入。这里的“非确定”不是说乱给，而是说它不是由程序bytecode固定决定的，而是prover提供的私有或外部输入。
-            /// 所以：
-            /// allow_non_determinism = true:
-            /// CSR 0x7c0 被认为是支持的特殊CSR。
-            /// allow_non_determinism = false:
-            /// CSR 0x7c0 不被这张表标记为支持。
+            // 所以：
+            // allow_non_determinism = true:
+            // CSR 0x7c0 被认为是支持的特殊CSR。
+            // allow_non_determinism = false:
+            // CSR 0x7c0 不被这张表标记为支持。
             let is_nondeterminism_csr = csr_index == NON_DETERMINISM_CSR as u32;
             // 第三步，判断它是不是delegation白名单里的CSR
             let is_allowed_for_delegation = supported_delegations.contains(&csr_index);

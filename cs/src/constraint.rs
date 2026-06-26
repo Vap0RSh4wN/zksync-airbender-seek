@@ -24,9 +24,23 @@ pub const TERM_INNER_CAPACITY: usize = 4;
 // #[derive(Clone, Debug, Copy, PartialEq, Eq)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 
-/// [Term::Expression] is coeff * prod(inner[0..degree]). The inner[..degree] slice is kept sorted, repeated variables encode powers.
+/// 多项式里的单项。
+///
+/// Term是Constraint的原子片段。它要么是常数，要么是一个单项式：
+///
+/// coeff * inner[0] * inner[1] * ... * inner[degree - 1]
+///
+/// 例子：
+/// 5                -> Constant(5)
+/// 3 * v1           -> coeff = 3, inner = [v1], degree = 1
+/// 2 * v1 * v2      -> coeff = 2, inner = [v1, v2], degree = 2
+///
+/// Term允许中间表达式暂时达到4次，这是为了给约束构造过程留空间。
+/// Constraint::normalize最终会要求归一化后的总次数不超过2。
 pub enum Term<F: PrimeField> {
+    /// 表示常数
     Constant(F),
+    /// 表示一个单项式 coeff * inner[0] * inner[1] * ... * inner[degree-1]
     Expression {
         coeff: F,
         inner: [Variable; TERM_INNER_CAPACITY], // we count on the fact that the degree is always <= 4
@@ -125,6 +139,12 @@ impl<F: PrimeField> Term<F> {
     /// For expressions, asserts unused slots are placeholders and sorts inner[..degree].
     /// Multiplication is commutative, x*y and y*x must be represented identically. Sorting inner[..degree] makes the representation unique.
     /// `combine` and `same_multiple` rely on simple slice equality. Sorting guarantees that equal monomials compare equal, so coefficients can be merged.
+    /// 排序变量，保证v1*v2和v2*v1用同一种内部表示。它也会把0系数表达式改成常数0。
+    /// 这个归一化让代码可以合并同类项：
+    /// 3*v1 + 5*v1
+    /// -> 8*v1
+    /// 2*v1*v2 + 4*v2*v1
+    /// -> 6*v1*v2
     pub fn normalize(&mut self) {
         if let Self::Expression { coeff, .. } = &*self {
             if coeff.is_zero() {
@@ -320,8 +340,27 @@ impl<F: PrimeField> Term<F> {
 }
 
 #[derive(Clone, Debug)]
-/// A polynomial represented as a sparse sum of monomial Terms.
-/// Arithmetic on constraints behaves like ordinary polynomial algebra: we normalize, combine like terms, and assert that after normalization the degree is <= 2.
+/// 等于0形式的稀疏多项式约束。
+///
+/// Constraint本质上是一组Term的和。Airbender里电路约束统一写成：
+///
+/// term_1 + term_2 + ... + term_n = 0
+///
+/// 例如rd = rs1 + rs2会写成：
+/// rs1 + rs2 - rd = 0
+///
+/// 如果只想在ADD family生效，就再乘上exec_flag，得到：
+/// is_add * (rs1 + rs2 - rd) = 0
+///
+/// 归一化后Constraint最高只允许二次。
+/// Term只表示乘法项，不表示完整等式。完整等式由Constraint保存。例如这个约束：
+/// is_add * (rs1 + rs2 - rd) = 0
+/// 展开成Term以后是：
+/// is_add * rs1
+/// + is_add * rs2
+/// - is_add * rd
+/// 每一项都是一个Term，整个和才是Constraint。Airbender把约束保持在二次以内，所以`is_add * rs1`这种二次项允许出现，
+/// 但`a * b * c`这种三次项最终不能留在Constraint里。
 pub struct Constraint<F: PrimeField> {
     pub terms: Vec<Term<F>>,
 }
@@ -387,12 +426,15 @@ impl<F: PrimeField> Constraint<F> {
         Self { terms: vec![term] }
     }
 
-    /// Splits the constraint into quadratic terms, linear terms and a constant.
-    /// Returns a triple (quadratic, linear, constant) where
+    /// 把Constraint拆成二次项、一次项和常数项，后续编译器可以根据这个结构把约束排进degree-2和degree-1约束表示。
+    ///
+    /// 返回值形状：
     /// quadratic: Vec<(coeff, a, b)>
     /// linear: Vec<(coeff, a)>
     /// constant: F
-    /// Panics if the constraint contains terms of degree > 2 or multiple constants.
+    ///
+    /// 第四章里，OneRowCompiler后续会把这个结果写进degree-2和degree-1约束布局。
+    /// 如果Constraint里还有次数大于2的项，或者出现多个常数项，这里会panic。
     pub fn split_max_quadratic(mut self) -> (Vec<(F, Variable, Variable)>, Vec<(F, Variable)>, F) {
         self.normalize();
         let mut quadratic_terms = Vec::with_capacity(self.terms.len());
@@ -480,7 +522,19 @@ impl<F: PrimeField> Constraint<F> {
     }
 
     #[track_caller]
-    /// Normalizes every term, sorts terms by the total order defined on Term, combines like terms and removes zeros, asserts the final degree is <= 2, converts a single zero term into an empty constraint.
+    /// 归一化Constraint。
+    ///
+    /// 这个函数按顺序做四件事：
+    /// 1. 归一化每个Term；
+    /// 2. 排序；
+    /// 3. 合并同类项并删除0项；
+    /// 4. 检查最终次数不超过2。
+    ///
+    /// 第四章里的例子：
+    /// 3*v1 + 5*v1      -> 8*v1
+    /// 2*v1*v2 + 4*v2*v1 -> 6*v1*v2
+    ///
+    /// Machine代码把RISC-V语义写成Constraint后，BasicAssembly::add_constraint会先调用这里。
     pub fn normalize(&mut self) {
         self.terms.iter_mut().for_each(|el| el.normalize());
         self.terms.sort();

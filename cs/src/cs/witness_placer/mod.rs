@@ -262,6 +262,7 @@ pub trait WitnessTypeSet<F: PrimeField>: 'static + Sized {
 
 /// We want to compute and place witness Variable as index,
 /// and use any arbitrary types to express computation of values
+/// 定义了“怎样读取变量值、怎样给变量赋值、怎样查表、怎样从oracle读取placeholder”等接口，是“填witness值”的执行器接口
 pub trait WitnessPlacer<F: PrimeField>: WitnessTypeSet<F> {
     fn record_resolver(&mut self, resolver: impl WitnessResolutionDescription<F, Self>);
 

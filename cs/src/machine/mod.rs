@@ -269,6 +269,18 @@ pub trait Machine<F: PrimeField>: 'static + Clone + Default {
         )
     }
 
+    /// produce_decoder_table_stub 遍历完整的三元组空间：
+    /// opcode: 7 bit  -> 0..127
+    /// funct3: 3 bit  -> 0..7
+    /// funct7: 7 bit  -> 0..127
+    /// 总共 2^(7+3+7) = 131072 个 key
+    /// 对每个 key，它依次询问 machine 支持的 opcode family：define_decoder_subspace
+    /// 若没有任何 supported opcode 匹配某个 key，produce_decoder_table_stub 保留 basic_invalid_bitmask；opcode_lookup 返回的 is_invalid 就会是 1。
+    /// 所以 OpTypeBitmask 表的返回不是一个大整数，而是两个输出：
+bitmask_0: 前 splitting[0] 个 bit
+bitmask_1: 后 splitting[1] 个 bit
+
+
     fn produce_decoder_table_stub() -> ([usize; 2], Vec<u64>) {
         // we want to walk over full subspace of u7 x u3 x u7 to collect:
         // - instruction format bits
@@ -282,18 +294,26 @@ pub trait Machine<F: PrimeField>: 'static + Clone + Default {
 
         // now we can properly form a bitmask
         let mut total_used_bits = 0usize;
+        // bit 0: is_invalid
         // invalid flag
         total_used_bits += 1;
         // encode format
         let opcode_format_offset = total_used_bits;
+        // 接下来的 NUM_INSTRUCTION_TYPES 个 bit: R/I/S/B/U/J format flags
         total_used_bits += NUM_INSTRUCTION_TYPES_IN_DECODE_BITS;
+        // major opcode family flags
+        // 例如 ADD_OP_KEY、LOAD_COMMON_OP_KEY、STORE_COMMON_OP_KEY
         let major_key_offset = total_used_bits;
         // and then - from all possible keys used by all the opcodes
         total_used_bits += major_keys.len();
+        // minor variant flags
+        // 例如同一个 family 内的具体变体
         let minor_key_offset = total_used_bits;
         // and then - maximum number of minor keys
         total_used_bits += max_minor_keys;
         // assert that we fit
+
+        // Mersenne31 field 不能安全容纳任意长度的 bitmask。produce_decoder_table_stub 计算 total_used_bits 后，把 bitmask 拆成两个 field 元素
         let field_capacity = F::CHAR_BITS - 1;
         assert!(total_used_bits <= field_capacity * 2);
         let mut splitting = [0usize; 2];

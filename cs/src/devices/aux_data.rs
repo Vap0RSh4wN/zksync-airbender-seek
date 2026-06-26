@@ -12,6 +12,7 @@ impl<F: PrimeField> PcWrapper<F> {
     pub fn initialize<C: Circuit<F>>(cs: &mut C) -> Self {
         // NOTE: it should go up in the call chain, but there is a duplicating comment at the start of the
         // state transition description. PC goes through the series of table lookups that ensure that it is 16 bits
+        // pc初始值来自当前行/当前chunk的输入占位符
         let pc = Register::<F>::new_unchecked_from_placeholder(cs, Placeholder::PcInit);
         Self { pc }
     }

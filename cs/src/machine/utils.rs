@@ -248,6 +248,11 @@ pub(crate) fn read_from_shuffle_ram_or_bytecode_no_decomposition_with_ctx<
     (result, query, is_ram_range)
 }
 
+/// 用pc从RomRead表读取当前指令。
+///
+/// 输入pc是一个32-bit寄存器值，但field不能安全承载任意u32 opcode，
+/// 所以RomRead表把opcode拆成两个16-bit limb返回。
+/// 这个函数先用RomAddressSpaceSeparator处理pc高位，再用RomRead查出opcode_low16和opcode_high16。
 pub(crate) fn read_opcode_from_rom<
     F: PrimeField,
     C: Circuit<F>,
@@ -256,24 +261,42 @@ pub(crate) fn read_opcode_from_rom<
     cs: &mut C,
     pc: Register<F>,
 ) -> Register<F> {
-    // we implement read via lookup, and we need to ensure that
-    // PC is in range, but checking that high half of PC only has lower bits
+    // 先确保ROM地址宽度不超过field安全范围。
+    // ROM 地址由 pc 高位拆分出的 rom_address_low 与 pc 低位组合。
+    // 组合后的位数不能超过 field 安全承载范围。main RISC-V 的 ROM_ADDRESS_SPACE_SECOND_WORD_BITS 在 risc_v_cycles 里配置，这里只保证地址编码不会溢出 field。
     assert!(16 + ROM_ADDRESS_SPACE_SECOND_WORD_BITS <= F::CHAR_BITS - 1);
 
+    // 第一个lookup读取pc高16位对应的ROM地址辅助信息：
+    // is_ram_range 表示当前高位是否落在RAM区，
+    // rom_address_low 表示组合ROM地址需要的高位部分。
+    // get_variables_from_lookup_constrained 做两件事：向 lookup_storage 登记一条 RomAddressSpaceSeparator 查询；分配输出变量。
+    // 第三章 create_table_driver_into_cs 已把这张表注册进 table_driver；lookup argument 后续证明查询行在 setup trace 的固定表里。
+    // ADD 行 pc_high=0 时，表输出 is_ram_range=0、rom_address_low=0。
     let [is_ram_range, rom_address_low] = cs.get_variables_from_lookup_constrained(
         &[LookupInput::from(pc.0[1].get_variable())],
         TableType::RomAddressSpaceSeparator,
     );
-    // assert that we only read opcodes from ROM, so "is RAM" is always false here
+    // instruction fetch只能从ROM读，所以这里强制is_ram_range = 0。
+    // Constraint::from(is_ram_range) 是次数为 1 的约束，要求 is_ram_range = 0。
+    // main machine 配置 USE_ROM_FOR_BYTECODE=true，取指不能从 RAM 读指令。若 witness 填 is_ram_range=1，电路不满足。
+    // 这条约束进入 constraint_storage
     cs.add_constraint_allow_explicit_linear(Constraint::<F>::from(is_ram_range));
+    // 把pc低16位和rom_address_low重新拼成完整ROM地址：
+    // rom_address = pc_low + 2^16 * rom_address_low
+    // ADD 行：pc_low=0，rom_address_low=0，故 rom_address=0。是两个 limb 变量在约束下的值。
     let rom_address_constraint = Term::from(pc.0[0].get_variable())
         + Term::from((F::from_u64_unchecked(1 << 16), rom_address_low));
 
+    // 第二个lookup在RomRead表里查出opcode的两个16-bit limb。
+    // 输入：上一行拼出的 rom_address_constraint（线性表达式，不是裸整数）。
+    // 输出：opcode 的两个 16-bit limb，变量 low 和 high。这里只分配 low、high 两个空 Variable，并把一条 lookup 记进 lookup_storage。
+    // 同时用 set_values 把一段计算登记进 witness_graph：「将来 witness 运行时，先算 rom_address，再查 RomRead 表，把结果写进 low/high」。
     let [low, high] = cs.get_variables_from_lookup_constrained(
         &[LookupInput::from(rom_address_constraint)],
         TableType::RomRead,
     );
 
+    // 返回值仍然是Register形状，[low16, high16]。
     let result = Register([Num::Var(low), Num::Var(high)]);
 
     result
@@ -445,6 +468,7 @@ pub(crate) fn update_register_op_as_shuffle_ram<F: PrimeField, C: Circuit<F>>(
     query
 }
 
+/// 把「读某个寄存器编号」封装成标准 `ShuffleRamMemQuery`
 pub fn form_mem_op_for_register_only<F: PrimeField>(
     local_timestamp_in_cycle: usize,
     reg_idx: Num<F>,
@@ -452,10 +476,12 @@ pub fn form_mem_op_for_register_only<F: PrimeField>(
     write_value: Register<F>,
 ) -> ShuffleRamMemQuery {
     ShuffleRamMemQuery {
+        // `query_type::RegisterOnly`明确这是寄存器访问，不是 RAM
         query_type: ShuffleRamQueryType::RegisterOnly {
-            register_index: reg_idx.get_variable(),
+            register_index: reg_idx.get_variable(), //`raw_decoder_output.rs1` 的 Variable，witness 为 1（x1 编号）
         },
-        local_timestamp_in_cycle,
+        local_timestamp_in_cycle, //`RS1_LOAD_LOCAL_TIMESTAMP`，本行第 0 次访问
+        // 同一组 limb 变量；读寄存器时写回值等于读值，表示「未修改寄存器内容」
         read_value: read_value.0.map(|el| el.get_variable()),
         write_value: write_value.0.map(|el| el.get_variable()),
     }

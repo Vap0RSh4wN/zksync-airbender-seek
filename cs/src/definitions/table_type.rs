@@ -10,6 +10,7 @@ pub const OR_TABLE_ID: u32 = 6;
     Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Debug, serde::Serialize, serde::Deserialize,
 )]
 #[repr(u32)]
+/// 固定表的类型标识。比如 And、Xor、ShiftImplementation、MemoryOffsetGetBits。
 pub enum TableType {
     ZeroEntry = 0,
     OpTypeBitmask,

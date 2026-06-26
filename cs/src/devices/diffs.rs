@@ -45,15 +45,24 @@ pub enum NextPcValue<F: PrimeField> {
 
 #[derive(Clone, Debug)]
 pub struct CommonDiffs<F: PrimeField> {
+    /// 当前 family 是否真的执行。ADD 行里 `AddOp` 的 `exec_flag=is_add=1`，其他 family 为 0。
     pub exec_flag: Boolean,
+    /// 异常路径。当前主线假设 trusted code，ADD/LW/SW 这里通常是 `None`。
     pub trapped: Option<Boolean>,
+    /// 异常路径。当前主线假设 trusted code，ADD/LW/SW 这里通常是 `None`。
     pub trap_reason: Option<Num<F>>,
+    /// 这个 family 提供的候选写回值。`Vec` 不是多余设计：有的 family 会给多个候选值，再用附带的 flag 二选一。典型例子是 LOAD，ROM 读和 RAM 读都可能成为候选。
     pub rd_value: Vec<([Constraint<F>; 2], Boolean)>,
+    /// 这个 family 对 next_pc 的意见。普通顺序执行返回 `Default`，jump/branch 返回 `Custom(target)`。
     pub new_pc_value: NextPcValue<F>,
 }
 
 impl<F: PrimeField> CommonDiffs<F> {
     #[track_caller]
+    /// 从所有opcode family给出的rd候选值中选择最终写回值。
+    ///
+    /// 每个family都可能返回一组rd_value和对应flag。
+    /// 这里只有flag为1的那一组会真正被选中。
     pub fn select_final_rd_value<CS: Circuit<F>>(cs: &mut CS, sources: &[Self]) -> Register<F> {
         let result = std::array::from_fn(|word_idx| {
             let mut flags = vec![];
@@ -78,6 +87,11 @@ impl<F: PrimeField> CommonDiffs<F> {
     }
 
     #[track_caller]
+    /// 选择当前行最终的next_pc。
+    ///
+    /// 默认情况走pc + 4；
+    /// jump、branch等family会提供自定义pc候选值。
+    /// 这个函数按照exec_flag从默认路径和自定义路径里选出真正的新pc。
     pub fn select_final_pc_value<CS: Circuit<F>>(
         cs: &mut CS,
         sources: &[Self],

@@ -38,6 +38,12 @@ pub enum ShuffleRamQueryType {
     RegisterOnly {
         register_index: Variable,
     },
+    /// is_register = 1:
+    ///   address 解释为寄存器编号
+    ///   read_value 来自 register file
+    /// is_register = 0:
+    ///   address 解释为 RAM 地址
+    ///   read_value 来自 RAM
     RegisterOrRam {
         is_register: Boolean,
         address: [Variable; REGISTER_SIZE],
@@ -94,10 +100,16 @@ impl ShuffleRamQueryType {
 // but itself, and ensure that eventually global read timestamp
 // is < global write timestamp + local offset
 #[derive(Debug, Clone, Copy)]
+/// 一次访问在电路里记成一条 query
+/// 寄存器读通常 read_value = write_value（读 x1 时「写回」仍是 x1，表示未改寄存器内容）。寄存器写时 read_value 是旧值，write_value 是新值。例如ADD 写 x5：read 100，write 16。
 pub struct ShuffleRamMemQuery {
+    /// 这次是纯寄存器访问，还是「寄存器或 RAM」二选一
     pub query_type: ShuffleRamQueryType,
+    /// 本行内的第几次访问（0、1、2…），用于排序
     pub local_timestamp_in_cycle: usize,
+    /// 读到的旧值两个 limb
     pub read_value: [Variable; REGISTER_SIZE],
+    /// 写入的新值两个 limb
     pub write_value: [Variable; REGISTER_SIZE],
 }
 
@@ -237,7 +249,11 @@ pub struct CircuitOutput<F: PrimeField> {
     pub state_input: Vec<Variable>,
     /// state_input和state_output保存跨行状态变量。main RISC-V通常最核心的是pc状态。它们告诉后面的compiler：这一行的结束状态要和下一行的开始状态连接。
     pub state_output: Vec<Variable>,
+    /// table_driver保存当前CircuitOutput已经注册好的固定表信息。
+    /// 第三章里setup trace正是根据这些表内容和setup layout生成的。
     pub table_driver: TableDriver<F>,
+    /// num_of_variables是电路构造阶段一共分配了多少个Variable。
+    /// 这仍然是“符号编号空间”的大小，不是最终trace列数。
     pub num_of_variables: usize,
     /// constraints保存普通多项式约束。比如某个变量必须等于两个变量相加，某个flag必须满足布尔性，某个candidate relation必须为0。这里的Constraint<F>还基于Variable，不是最终列地址
     pub constraints: Vec<(Constraint<F>, bool)>,
@@ -804,6 +820,7 @@ pub trait Circuit<F: PrimeField>: Sized {
     );
 
     #[track_caller]
+    /// 向 lookup_storage 登记一条 RomAddressSpaceSeparator 查询；分配输出变量
     fn get_variables_from_lookup_constrained<const M: usize, const N: usize>(
         &mut self,
         inputs: &[LookupInput<F>; M],

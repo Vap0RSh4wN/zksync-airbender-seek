@@ -108,8 +108,8 @@ impl<
         RS: RegisterValueSource<F>,
         DE: DecoderOutputSource<F, RS>,
         BS: IndexableBooleanSet,
-        const SUPPORT_SRA: bool,
-        const SUPPORT_ROT: bool,
+        const SUPPORT_SRA: bool, //SUPPORT_SRA = true
+        const SUPPORT_ROT: bool, //SUPPORT_ROT = false
     > MachineOp<F, ST, RS, DE, BS> for ShiftOp<SUPPORT_SRA, SUPPORT_ROT>
 {
     fn define_used_tables() -> Vec<TableType> {

@@ -15,7 +15,9 @@ pub mod state_transition_parts;
 
 #[derive(Clone, Debug)]
 pub struct BasicFlagsSource {
+    /// 编译期登记的 major/minor key 顺序
     keys: DecoderOutputExtraKeysHolder,
+    /// decode 出的 other_bits，与 keys 一一对应
     values: Vec<Boolean>,
 }
 
@@ -31,7 +33,7 @@ impl IndexableBooleanSet for BasicFlagsSource {
     #[track_caller]
     fn get_major_flag(&self, major: DecoderMajorInstructionFamilyKey) -> Boolean {
         let major_index = self.keys.get_major_index(&major);
-        self.values[major_index]
+        self.values[major_index] // ADD_OP_KEY → values 里对应位
     }
 
     #[track_caller]
@@ -42,7 +44,7 @@ impl IndexableBooleanSet for BasicFlagsSource {
     ) -> Boolean {
         let (_major_index, minor_index) = self.keys.get_index_set(&major, &minor);
         let offset = self.keys.num_major_keys();
-        self.values[offset..][minor_index]
+        self.values[offset..][minor_index] // 如 LOAD_WORD_OP_KEY
     }
 }
 
@@ -87,12 +89,19 @@ impl<F: PrimeField> DecoderOutputSource<F, RegisterDecomposition<F>>
 
 #[derive(Clone, Debug)]
 pub struct BasicDecodingResultWithSigns<F: PrimeField> {
+    /// 默认 `pc + 4`。jump/branch family 会决定是否覆盖它。
     pub pc_next: Register<F>,
+    /// 源操作数。ADD 直接取寄存器 limb；branch 会继续看 `sign_bit`。
     pub src1: RegisterDecompositionWithSign<F>,
+    /// 源操作数。ADD 直接取寄存器 limb；branch 会继续看 `sign_bit`。
     pub src2: RegisterDecompositionWithSign<F>,
+    /// decoder 已经按 I/S/B/U/J 格式重建好的统一 32-bit immediate。
     pub imm: Register<F>,
+    /// 寄存器编号，不是寄存器值。LOAD/STORE 在 slot1 不是 RAM 访问时，需要它去绑定寄存器地址。
     pub rs2_index: Constraint<F>,
+    /// 3-bit 子操作字段。LOAD/STORE 用它区分 byte/half/word，binop/shift 也会用。
     pub funct3: Num<F>,
+    /// SYSTEM/CSR 相关的 12-bit 字段。ADD 不用它。
     pub funct12: Constraint<F>,
 }
 
@@ -460,11 +469,8 @@ where
     // shuffle RAM query
     // delegation request
     // state input / state output
-
     // 返回：initial_state，final_state
-
     // 这两个表示一行状态转移的入口状态和出口状态。对main RISC-V来说，最核心的跨行状态通常是pc相关状态。也就是：
-
     // 这一行开始时pc是多少，这一行结束后下一行pc是多少，表示这一行开始和结束时需要跨行连接的状态变量。
     let (initial_state, final_state) =
         M::describe_state_transition::<_, ROM_ADDRESS_SPACE_SECOND_WORD_BITS>(&mut cs);

@@ -14,12 +14,22 @@ use field::PrimeField;
 pub const LIMB_WIDTH: usize = 16;
 pub const LIMB_MASK: u64 = (1 << LIMB_WIDTH) - 1;
 
-/// A numeric value that is either a circuit variable or a known constant
-/// field element (`Constant`).  Passing `Num` around allows gadget code to avoid
-/// allocating unnecessary variables when operands are known constants.
+/// 数值包装器。
+///
+/// Num把“一个电路数值”分成两种来源：
+/// Var表示这个值来自某个Variable；
+/// Constant表示这个值在编译电路时已经已知，不需要再分配新的Variable。
+///
+/// 第四章里会反复遇到这种情况：
+/// 表id、2^16、0、1这类对象是Constant；
+/// rs1_low、rs2_low、rd_low这类执行相关对象是Var。
+///
+/// 这个包装减少无意义变量分配。Machine代码不需要把所有常量都先装进Variable。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Num<F: PrimeField> {
+    /// 来自Circuit里的某个Variable。
     Var(Variable),
+    /// 编译期已知的field常量。
     Constant(F),
 }
 
@@ -71,19 +81,23 @@ impl<F: PrimeField> Num<F> {
     }
 }
 
-/// Boolean value represented inside the circuit.
+/// 电路里的布尔值包装。
 ///
-/// Variants:
-/// * `Is` – direct variable holding 0/1.
-/// * `Not` – logical negation of an existing variable (no extra allocation).
-/// * `Constant` – compile-time known value.
+/// 布尔值在Airbender里经常表示opcode family flag、instruction format flag、is_register、
+/// is_zero等控制位。Boolean把它分成三种视图：
+/// Is表示变量本身；
+/// Not表示1 - v这个取反视图；
+/// Constant表示编译期已知真假值。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Boolean {
     /// Existential view of the boolean variable
+    /// 表示变量v取0或1
     Is(Variable),
     /// Negated view of the boolean variable
+    /// 表示1-v这个视图
     Not(Variable),
     /// Constant (not an allocated variable)
+    /// 表示编译期已知的布尔值
     Constant(bool),
 }
 
@@ -112,8 +126,13 @@ impl Boolean {
             Boolean::Constant(_) => None,
         }
     }
-    /// Creates and allocates a new boolean variable.
-    /// Constraint: (1 - a) * a = 0
+    /// 创建一个新的布尔变量。
+    ///
+    /// 布尔约束是：
+    ///
+    /// (1 - a) * a = 0
+    ///
+    /// 这条约束只允许a取0或1。
     pub fn new<F: PrimeField, C: Circuit<F>>(circuit: &mut C) -> Self {
         circuit.add_boolean_variable()
     }
@@ -947,22 +966,25 @@ impl<F: PrimeField> Register<F> {
         Self(vars)
     }
 
+    /// -> 创建两个变量，分别代表pc_low16和pc_high16
+    /// -> 把这两个变量和PcInit placeholder关联起来
+    /// 假设第一行pc是0，witness阶段会把：
+    /// pc_low16  = 0
+    /// pc_high16 = 0
+    /// 填入这两个变量。
     pub fn new_unchecked_from_placeholder<CS: Circuit<F>>(
         cs: &mut CS,
         placeholder: Placeholder,
     ) -> Self {
-        let new = Self::new_unchecked(cs);
+        let new = Self::new_unchecked(cs); // 分配 low/high 两个 Variable，暂不 range check
 
-        // set value
         let vars = new.0.map(|el| el.get_variable());
         let value_fn = move |placer: &mut CS::WitnessPlacer| {
-            let value = placer.get_oracle_u32(placeholder);
-
-            placer.assign_u32_from_u16_parts(vars, &value);
+            let value = placer.get_oracle_u32(placeholder); // 从 oracle 取真实 32-bit 值
+            placer.assign_u32_from_u16_parts(vars, &value); // 拆成两个 limb 写入
         };
 
-        cs.set_values(value_fn);
-
+        cs.set_values(value_fn); // 登记 witness 计算，构造期不填数
         new
     }
 
@@ -1220,13 +1242,21 @@ impl<F: PrimeField> RegisterWithSign<F> {
 // To be used only for operands coming from decoder
 #[derive(Clone, Debug)]
 pub struct RegisterDecompositionWithSign<F: PrimeField> {
+    /// 原始 32-bit 寄存器值的两个 16-bit limb。ADD 主要用这两个 limb 做加法。
     pub u16_limbs: [Num<F>; 2],
+    /// 把低 16 位拆成两个字节。第一个元素是低字节 `byte_0`，第二个元素是由线性约束恢复出来的高字节 `byte_1`。
     pub low_word_unconstrained_decomposition: (Variable, Constraint<F>),
+    /// 把高 16 位拆成低字节 `byte_2` 和高字节 `byte_3`。
     pub high_word_decomposition: (Constraint<F>, Variable),
+    /// 最高位 bit31。把 32-bit 寄存器看成有符号整数时，`sign_bit=1` 表示负数。
     pub sign_bit: Boolean,
 }
 
 impl<F: PrimeField> RegisterDecompositionWithSign<F> {
+    /// 1. 取出 `Register<F>` 的两个 limb；
+    /// 2. 给低 16 位分配 `byte_0`，再用线性约束恢复 `byte_1`；
+    /// 3. 用 `U16GetSignAndHighByte` 查表，从高 16 位同时得到 `sign_bit` 和 `byte_3`，再恢复 `byte_2`；
+    /// 4. 把这些结果打包成 `RegisterDecompositionWithSign`。
     pub fn parse_reg<CS: Circuit<F>>(cs: &mut CS, reg: Register<F>) -> Self {
         let byte_0 = cs.add_variable();
         let low_word = reg.0[0].get_variable();

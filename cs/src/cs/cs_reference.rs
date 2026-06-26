@@ -22,15 +22,32 @@ pub const RESOLVE_WITNESS: bool = true;
 #[cfg(not(feature = "debug_evaluate_witness"))]
 pub const RESOLVE_WITNESS: bool = false;
 
+/// Machine代码写约束时使用的规则收集器。
+///
+/// 第四章里，compile_machine先创建BasicAssembly，再把固定表注册进去，
+/// 然后调用Machine::describe_state_transition向这个对象写入：
+/// 约束、lookup query、shuffle RAM query、布尔变量、range check和placeholder映射。
+///
+/// BasicAssembly不负责决定列布局。它只记录“这一行CPU语义需要哪些规则”。
+/// cs.finalize之后，这些记录会进入CircuitOutput。
 pub struct BasicAssembly<F: PrimeField, W: WitnessPlacer<F> = CSDebugWitnessEvaluator<F>> {
+    /// 下一个可分配的Variable编号。
     no_index_assigned: u64,
+    /// 普通多项式约束存储区。保存多项式等于0的约束。ADD低16位加法关系、pc + 4关系、writeback地址关系都会进入这里。
     constraint_storage: Vec<(Constraint<F>, bool)>,
+    /// lookup查询存储区。保存查表请求。ROM读取、decoder分解、range check、bit操作辅助表最终都以lookup形式出现。lookup不是普通等式，它表达“这一组输入输出必须出现在某张表里”。
     lookup_storage: Vec<LookupQuery<F>>,
+    /// RAM和寄存器统一memory argument查询。保存寄存器和RAM访问。它不直接证明读写一致，只把每行CPU发生的读写记录下来。后续memory argument消费这些query。
     pub shuffle_ram_queries: Vec<ShuffleRamMemQuery>,
+    /// 必须满足0/1约束的变量。
     boolean_variables: Vec<Variable>,
+    /// range check请求。
     rangechecked_expressions: Vec<RangeCheckQuery<F>>,
+    /// 把placeholder映射到具体Variable。witness generation执行guest程序时，会根据placeholder知道某个Variable应该填入哪个运行时值。
     placeholder_query: HashMap<(Placeholder, usize), Variable>,
+    /// 需要在后续阶段链接的变量对。
     linkage_queries: Vec<LinkedVariablesPair>,
+    /// 已经注册到当前Circuit里的固定表内容。保存当前Machine使用的固定表内容或表类型。第三章里的setup trace会根据它生成固定表列。第四章里只需要确认Machine把哪些表注册进Circuit。
     table_driver: TableDriver<F>,
     delegated_computation_requests: Vec<DelegatedComputationRequest>,
     degegated_request_to_process: Option<DelegatedProcessingData>,
@@ -46,6 +63,10 @@ pub struct BasicAssembly<F: PrimeField, W: WitnessPlacer<F> = CSDebugWitnessEval
 impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
     type WitnessPlacer = W;
 
+    /// 创建一个空的规则收集器。
+    ///
+    /// 初始状态下没有任何变量、约束、lookup、memory query和表内容；
+    /// table_driver也是空的，后面由create_table_driver_into_cs或手动add_table_with_content填充。
     fn new() -> Self {
         Self {
             no_index_assigned: 0,
@@ -70,6 +91,7 @@ impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
     }
 
     #[track_caller]
+    /// 创建一个新的变量编号，只分配编号。源码返回Variable(self.no_index_assigned)，随后把计数器加一。这个变量没有执行值，也没有列号。
     fn add_variable(&mut self) -> Variable {
         // if self.no_index_assigned == 203 {
         //     panic!("debug");
@@ -85,10 +107,15 @@ impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
     }
 
     #[track_caller]
+    /// 如果当前BasicAssembly带着一个witness_placer，它立刻调用record_resolver。无论有没有witness_placer，它都会把这段计算加入witness_graph。
     fn set_values(&mut self, node: impl WitnessResolutionDescription<F, W>) {
         if let Some(witness_placer) = self.witness_placer.as_mut() {
+            // 有debug witness evaluator：set_values会立刻执行这段计算，把变量值填到debug evaluator里。
+            // debug路径带着CSDebugWitnessEvaluator。这时set_values会立刻执行计算。它的用途是调试电路构造过程：
+            // 代码在创建约束时可以同时算出一份具体witness，随后try_check_constraint或is_satisfied这类调试逻辑可以发现约束写错、lookup表缺失、witness计算不一致等问题。
             witness_placer.record_resolver(node.clone_self());
         }
+        // 没有debug witness evaluator：set_values只把计算步骤记录进witness_graph，稍后再用。
         self.witness_graph.append_inplace(node);
     }
 
@@ -117,7 +144,9 @@ impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
         }
     }
 
+    /// 加入已经构造好的表
     fn add_table_with_content(&mut self, table_type: TableType, table: LookupWrapper<F>) {
+        // 把调用方已经构造好的表加入主driver。这里不调用generate_table。
         self.table_driver
             .add_table_with_content(table_type, table.clone());
         if let Some(witness_placer) = self.witness_placer.as_mut() {
@@ -151,6 +180,11 @@ impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
     }
 
     #[track_caller]
+    /// `BasicAssembly::add_constraint`接收一个`Constraint`，要求它的次数为2，归一化，然后存入`constraint_storage`。
+    /// 线性约束使用`add_constraint_allow_explicit_linear`。
+    ///
+    /// 这个入口对应第四章里的“把多项式交给Circuit”：
+    /// Machine代码构造出Constraint后，调用cs.add_constraint，最后进入CircuitOutput.constraints。
     fn add_constraint(&mut self, mut constraint: Constraint<F>) {
         assert!(constraint.degree() == 2, "use `add_constraint_allow_explicit_linear` if you need to make a variable arising from linear constraint");
         assert!(constraint.degree() <= 2);
@@ -178,6 +212,7 @@ impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
         self.constraint_storage.push((constraint, true));
     }
 
+    /// 登记寄存器或RAM访问
     fn add_shuffle_ram_query(&mut self, query: ShuffleRamMemQuery) {
         self.shuffle_ram_queries.push(query);
     }
@@ -511,6 +546,8 @@ impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
     }
 
     #[track_caller]
+    /// 只分配空 Variable，并把一条 lookup 记进 lookup_storage
+    /// 同时用 set_values 把一段计算登记进 witness_graph：「将来 witness 运行时，先算 rom_address，再查 RomRead 表，把结果写进 low/high」。
     fn get_variables_from_lookup_constrained<const M: usize, const N: usize>(
         &mut self,
         inputs: &[LookupInput<F>; M],
@@ -527,10 +564,18 @@ impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
         }
 
         assert!(M == 1 || M == 2);
-
+        // 创建输出变量
+        // 对于RomRead，N=2，所以创建：
+        // low_opcode_var
+        // high_opcode_var
         let output_variables: [Variable; N] = std::array::from_fn(|_| self.add_variable());
 
         let inputs_vars = inputs.clone();
+        // 将来生成witness时：
+        // 读取lookup输入值；
+        // 用table_id找到表；
+        // 查表得到输出；
+        // 把输出写入刚才创建的output_variables。
         let value_fn = move |placer: &mut Self::WitnessPlacer| {
             let input_values: [_; M] = std::array::from_fn(|i| inputs_vars[i].evaluate(placer));
             let table_id = <Self::WitnessPlacer as WitnessTypeSet<F>>::U16::constant(
@@ -541,6 +586,7 @@ impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
                 placer.assign_field(*var, value);
             }
         };
+        /// 同时用 set_values 把一段计算登记进 witness_graph：「将来 witness 运行时，先算 rom_address，再查 RomRead 表，把结果写进 low/high」。
         self.set_values(value_fn);
 
         let input_len = M;
@@ -551,6 +597,16 @@ impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
                 LookupInput::Variable(output_variables[idx - input_len])
             }
         });
+        // 对于RomRead，登记结果是：
+        // lookup_storage.push(
+        //     table = RomRead,
+        //     row = [
+        //         rom_address,
+        //         low_opcode_var,
+        //         high_opcode_var
+        //     ]
+        // )
+        // 这就是“注册lookup query”，记录：以后这个row必须存在于RomRead表中。
         let query = LookupQuery {
             row,
             table: LookupQueryTableType::Constant(table_type),
@@ -560,6 +616,10 @@ impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
         output_variables
     }
 
+    /// 登记一条约束，等到以后的cs.finalize()后，不同请求进入不同的地方。
+    /// 举例，range check请求进入CircuitOutput.range_check_expressions。
+    /// 后续OneRowCompiler拿到range_check_expressions，再把它们编译到lookup/range-check布局里。
+    /// 编译器入口会把range_check_expressions从CircuitOutput里取出来，和boolean vars、lookup、table driver等一起处理。
     fn require_invariant(&mut self, variable: Variable, invariant: Invariant) {
         match invariant {
             Invariant::Boolean => self.boolean_variables.push(variable),
@@ -572,6 +632,17 @@ impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
                 self.rangechecked_expressions.push(query)
             }
             Invariant::Substituted((placeholder, subindex)) => {
+                // 某个抽象placeholder，在本电路里对应哪个Variable。placeholder_query是一个HashMap：HashMap<(Placeholder, usize), Variable>
+                // key是：(placeholder, subindex)
+                // value是：variable
+                // 在电路构造时，最终仍然要落到具体Variable上。Invariant::Substituted((placeholder, subindex))就是记录这个对应关系。
+                // 例如：
+                // (Placeholder::PcInit, 0) -> pc_low_variable
+                // (Placeholder::PcInit, 1) -> pc_high_variable
+                // 为什么还需要subindex？因为一个placeholder可能对应多个field变量。例如一个32-bit寄存器拆成两个16-bit limb：
+                // PcInit, subindex 0 -> pc_low
+                // PcInit, subindex 1 -> pc_high
+                // 或者某个register value也可能有low/high两个limb。
                 self.placeholder_query
                     .insert((placeholder, subindex), variable);
             }
@@ -640,6 +711,11 @@ impl<F: PrimeField, W: WitnessPlacer<F>> Circuit<F> for BasicAssembly<F, W> {
         }
     }
 
+    /// finalize把BasicAssembly内部收集的规则打包成CircuitOutput。
+    ///
+    /// 第四章里，compile_machine在Machine::describe_state_transition返回之后调用这里。
+    /// 这一步仍然只处理Variable、Constraint、LookupQuery和ShuffleRamMemQuery，
+    /// 不处理最终列布局。OneRowCompiler下一步才把它们映射到ColumnAddress。
     fn finalize(mut self) -> (CircuitOutput<F>, Option<W>) {
         // Out default behavior is to enforce 8-bit range-checks in the same way as generic lookups.
         // Later on the compiler will place the variables, but we will add corresponding lookup queries

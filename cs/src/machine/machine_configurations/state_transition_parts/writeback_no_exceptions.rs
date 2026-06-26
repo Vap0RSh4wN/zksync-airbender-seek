@@ -1,6 +1,12 @@
 use super::*;
 use crate::machine::machine_configurations::minimal_state::MinimalStateRegistersInMemory;
 
+/// 把各opcode family返回的候选结果合并成当前行最终状态。
+///
+/// 这一层做三件事：
+/// 1. 选择最终rd候选值；
+/// 2. 把slot 2约束成正确的寄存器写回或空写回；
+/// 3. 登记三个shuffle RAM query，并选择最终next_pc。
 pub(crate) fn writeback_no_exception_with_opcodes_in_rom<
     F: PrimeField,
     CS: Circuit<F>,
@@ -30,6 +36,7 @@ pub(crate) fn writeback_no_exception_with_opcodes_in_rom<
 
             // we do not care about predicating state updates below, because if trap happens it's already unsatisfiable circuit
 
+            // 从所有opcode family返回的rd候选值里选出真正执行的那个。
             let new_reg_val = CommonDiffs::select_final_rd_value(cs, &application_results);
 
             // if we will not update register and do not execute memory store, then
@@ -38,11 +45,13 @@ pub(crate) fn writeback_no_exception_with_opcodes_in_rom<
             let [r_insn, i_insn, _s_insn, b_insn, u_insn, j_insn] = opcode_format_bits;
 
             // opcode formats are orthogonal flags, so a boolean to update RD is just a linear combination
+            // R / I / J / U格式会写rd，B格式不写rd。
             let update_rd = Constraint::from(r_insn.get_variable().unwrap())
                 + Constraint::from(i_insn.get_variable().unwrap())
                 + Constraint::from(j_insn.get_variable().unwrap())
                 + Constraint::from(u_insn.get_variable().unwrap());
 
+            // rd本身来自decoder输出；如果rd = x0，则写回值会被mask成0，符合RISC-V的x0规则。
             let rd = cs.add_variable_from_constraint_allow_explicit_linear(rd_constraint.clone());
             let reg_is_zero = cs.is_zero(Num::Var(rd));
             // we ALWAYS write to register (with maybe modified value), unless we write to RAM, except for B-format opcodes (
@@ -58,7 +67,7 @@ pub(crate) fn writeback_no_exception_with_opcodes_in_rom<
                     * Term::from(new_reg_val.0[1]),
             );
 
-            // now constraint that if we do update register, then address is correct
+            // 如果当前行确实更新rd，就要求slot 2的地址等于decoder给出的rd。
             let ShuffleRamQueryType::RegisterOrRam {
                 is_register,
                 address,
@@ -76,7 +85,7 @@ pub(crate) fn writeback_no_exception_with_opcodes_in_rom<
             cs.add_constraint((Term::from(address[0])) * Term::from(b_insn));
             cs.add_constraint((Term::from(address[1])) * Term::from(b_insn));
 
-            // and constraint value
+            // 如果当前行更新rd，就要求slot 2的write value等于最终选中的寄存器写回值。
             cs.add_constraint(
                 (Term::from(reg_write_value_low)
                     - Term::from(rd_or_mem_store_query.write_value[0]))
@@ -95,14 +104,16 @@ pub(crate) fn writeback_no_exception_with_opcodes_in_rom<
                 (Term::from(rd_or_mem_store_query.write_value[1])) * Term::from(b_insn),
             );
 
-            // push all memory queries
+            // 把预分配好的三个query正式登记进CircuitOutput.shuffle_ram_queries。
             cs.add_shuffle_ram_query(rs1_query);
             cs.add_shuffle_ram_query(rs2_or_mem_load_query);
             cs.add_shuffle_ram_query(rd_or_mem_store_query);
 
+            // 从默认pc + 4和各opcode family提供的自定义pc候选值里选出真正的next_pc。
             let new_pc =
                 CommonDiffs::select_final_pc_value(cs, &application_results, default_next_pc);
 
+            // main machine当前最核心的跨行状态就是新的pc。
             let final_state = MinimalStateRegistersInMemory { pc: new_pc };
 
             cs.set_log(&opt_ctx, "EXECUTOR");

@@ -98,19 +98,31 @@ impl OptCtxIndexers {
     }
 }
 
+/// 当前 CPU row 的统一关系缓冲区。各个 opcode family 把候选关系登记到不同数组里。
+/// 若每个 AddOp/LoadOp 各自 add_constraint，会重复分配 carry、range check 变量。
+/// OptimizationContext 把同类关系攒在一起，enforce_all 时按 exec_flag 加权合并，再写一组约束——既省列数，又保持「一行只生效一个 family」。
+/// 1. **登记阶段**：family 把“如果我执行，就应满足什么关系”放进对应缓冲区；
+/// 2. **enforce 阶段**：按 indexer 把同类关系合并，再统一写出约束。
 pub struct OptimizationContext<F: PrimeField, C: Circuit<F>> {
     pub indexers: OptCtxIndexers,
+    /// 加减法关系。ADD、SUB、地址计算都走这里。
     add_sub_relations: Vec<(usize, AddSubRelation<F>)>,
     u16_to_u8x2_decomposition_relations: Vec<(usize, RangeCheckRelation<F>)>,
     u16_range_check_relations: Vec<(usize, RangeCheckRelation<F>)>,
+    /// 乘除法关系。
     mul_div_relations: Vec<(usize, MulDivRelation<F>)>,
+    /// 条件查表关系。
     lookup_relations: Vec<(usize, LookupRelation<F>)>,
+    /// 零判断关系。
     is_zero_relations: Vec<(usize, IsZeroRelation<F>)>,
 
     u16_to_u8x2_splits: Vec<(Num<F>, Num<F>)>,
+    /// 复用的输出变量池，避免每个 family 都重新分配一组新变量。
     registers: Vec<Register<F>>,
+    /// 复用的输出变量池，避免每个 family 都重新分配一组新变量。
     add_sub_ofs: Vec<Boolean>,
     is_zero_flags: Vec<Boolean>,
+    /// 复用的输出变量池，避免每个 family 都重新分配一组新变量。
     lookup_outputs: Vec<Variable>,
 
     _marker: std::marker::PhantomData<(F, C)>,
@@ -166,6 +178,10 @@ impl<F: PrimeField, CS: Circuit<F>> OptimizationContext<F, CS> {
     }
 
     #[track_caller]
+    /// 登记一条加法关系。
+    ///
+    /// 这里先只保存“a + b = res”这件事和对应exec_flag，不立即调用cs.add_constraint。
+    /// 第四章里的AddOp::apply正是通过这个入口把ADD关系送进OptimizationContext。
     pub fn append_add_relation(
         &mut self,
         a: Register<F>,
@@ -537,6 +553,10 @@ impl<F: PrimeField, CS: Circuit<F>> OptimizationContext<F, CS> {
     }
 
     #[track_caller]
+    /// 为加法或减法分配结果寄存器，并登记对应关系。
+    ///
+    /// 返回值里的res是后续writeback或其他opcode逻辑要读取的候选结果，
+    /// witness generation也会在这里提前把res和溢出flag的值准备好。
     fn append_add_sub_relation(
         &mut self,
         a: Register<F>,
@@ -556,6 +576,9 @@ impl<F: PrimeField, CS: Circuit<F>> OptimizationContext<F, CS> {
             of
         };
 
+        // 统一存成a + b = c的形状。
+        // 对减法，改写成res + b = a；
+        // 对加法，保持a + b = res。
         let relation = if is_sub {
             AddSubRelation {
                 exec_flag,
@@ -752,8 +775,13 @@ impl<F: PrimeField, CS: Circuit<F>> OptimizationContext<F, CS> {
         outputs
     }
 
+    /// 把OptimizationContext里积累的关系统一落成Circuit约束。
+    ///
+    /// 这一层是第四章里“Machine语义真正进入CircuitOutput”的关键边界：
+    /// append_add_relation、append_lookup_relation等先登记候选关系，
+    /// enforce_all再集中调用cs.add_constraint、lookup相关接口，把它们写进BasicAssembly。
     pub fn enforce_all(&mut self, cs: &mut CS) {
-        // we have 7 different types of relations to enforce
+        // 这里会依次处理多种关系类型。
 
         // 1) enforcing add-sub relations
         let mut num_elements_processes = 0;
@@ -785,10 +813,9 @@ impl<F: PrimeField, CS: Circuit<F>> OptimizationContext<F, CS> {
                 }
             }
 
-            // here is the trick: our all zeroes (for flags and similar) are satisfying witness for us,
-            // so we can merge selection (potentially dummy one) and enforcement of the relation. The only inconvenience is
-            // to set the value to the intermediate carry. Addition constraints are degree 1 over "what to add",
-            // so with selection - we have degree 2
+            // 这里把“由哪个opcode family生效”与“加法关系本身”合并处理。
+            // 直觉上，相当于把多份候选(a, b, c)按flag加权选出来，再只写一组约束。
+            // 由于flag是一阶、括号里的加法关系也是一阶，所以最后仍保持二次约束。
 
             if can_spec {
                 enforce_add_sub_relation(cs, self.add_sub_ofs[cur_index], &a_s, &b_s, &c_s, &flags);
@@ -837,6 +864,7 @@ impl<F: PrimeField, CS: Circuit<F>> OptimizationContext<F, CS> {
                     );
                 }
 
+                // 低16位可能产生进位，先引入一个中间carry变量把32-bit加法拆成两个16-bit关系。
                 let carry_intermediate = Boolean::new(cs);
 
                 let constraint_low = a_constraint_low + b_constraint_low - c_constraint_low;
@@ -851,6 +879,8 @@ impl<F: PrimeField, CS: Circuit<F>> OptimizationContext<F, CS> {
                     carry_intermediate.get_variable().unwrap(),
                 );
 
+                // 低位约束：
+                // a_low + b_low - c_low - 2^16 * carry = 0
                 let constraint_low = constraint_low
                     - Term::<F>::from((
                         F::from_u64_unchecked(1 << 16),
@@ -858,6 +888,8 @@ impl<F: PrimeField, CS: Circuit<F>> OptimizationContext<F, CS> {
                     ));
                 cs.add_constraint(constraint_low);
 
+                // 高位约束：
+                // a_high + b_high - c_high + carry - 2^16 * carry_out = 0
                 let constraint_high = a_constraint_high + b_constraint_high - c_constraint_high
                     + Term::<F>::from(carry_intermediate.get_variable().unwrap())
                     - Term::<F>::from((
