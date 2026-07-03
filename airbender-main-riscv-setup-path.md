@@ -1,5 +1,9 @@
 # main RISC-V setup路径
 
+[TOC]
+
+
+
 ## 0. 前后关系
 
 Airbender证明流程分成setup、witness、prove三层：
@@ -66,7 +70,7 @@ SetupPrecomputations使用CompiledCircuitArtifact.setup_layout和独立TableDriv
 最终get_main_riscv_circuit_setup返回MainCircuitPrecomputations。
 
 > [!TIP]
-> 当前main RISC-V setup入口使用固定ROM上限。如果有两个程序，都padding到相同ROM上限时，RomRead表行数相同，get_machine得到的total_tables_len相同，setup_layout里的generic lookup列组数也相同。但不同程序的RomRead表行内容可以不同，例如程序A在pc=0处的low和high，可能不同于程序B在pc=0处的low和high。因此，列布局相同，setup固定表可能内容不同。
+> 当前main RISC-V setup入口使用固定ROM上限。如果有两个程序，都padding到相同ROM上限时，RomRead表行数相同，get_machine得到的total_tables_len相同，setup_layout里的generic lookup列组数也相同。但不同程序的RomRead表行内容可以不同，例如程序A在pc=0处的low和high，可能不同于程序B在pc=0处的low和high。因此列布局相同，setup固定表可能内容不同。
 
 ## 1. setup层数据结构
 
@@ -107,7 +111,7 @@ CircuitOutput中的约束来自Machine::describe_state_transition对Circuit接�
 
 CompiledCircuitArtifact位于cs/src/one_row_compiler/mod.rs，由OneRowCompiler内部的compile_inner构建并返回。
 
-它把Variable编号替换成ColumnAddress，保存一系列layout，最终在setup阶段读取setup_layout，witness阶段读取witness_layout、memory_layout和variable_mapping，prove阶段读取compiled constraints、layout和argument相关布局。
+它把Variable编号替换成ColumnAddress，保存一系列layout，最终在setup阶段读取setup_layout，其他都在后续witness和proving阶段继续用。
 
 ```rust
 // cs/src/one_row_compiler/mod.rs
@@ -1374,9 +1378,9 @@ cs.add_shuffle_ram_query把slot0、slot1、slot2追加到BasicAssembly.shuffle_r
 
 #### 2.6.7 describe_state_transition约束汇总
 
-从default_compile_machine开始，BasicAssembly收集Constraint、LookupQuery、RangeCheckQuery、Boolean variable和ShuffleRamQuery。compile_machine调用finalize后，这些对象进入CircuitOutput。
+从default_compile_machine开始，BasicAssembly执行过程中收集Constraint、LookupQuery、RangeCheckQuery、Boolean variable和ShuffleRamQuery。compile_machine调用finalize后，这些对象进入CircuitOutput，随后default_compile_machine把RomRead和SpecialCSRProperties补进CircuitOutput.table_driver。
 
-cs/src/machine/utils.rs::read_opcode_from_rom的取指约束把pc连接到当前bytecode里的instruction，pc_high查询RomAddressSpaceSeparator，pc_low和rom_address_low组合成RomRead地址，RomRead返回low和high。
+cs/src/machine/utils.rs::read_opcode_from_rom的**取指约束(2.6.1, 2.6.2)**把pc连接到当前bytecode里的instruction，pc_high查询RomAddressSpaceSeparator，得到的is_ram_range约束为0，表示取指必须来自ROM；pc_low和rom_address_low组合出RomRead地址，RomRead返回instruction的low和high两个16-bit limb。
 
 ```text
 lookup_RomAddressSpaceSeparator(pc_high) == (is_ram_range, rom_address_low)
@@ -1387,7 +1391,7 @@ lookup_RomRead(rom_address) == (low, high)
 instruction = low + 2^16 * high
 ```
 
-cs/src/machine/decoder/decode_optimized_must_handle_csr.rs::OptimizedDecoder::decode的decoder约束把instruction拆成字段，并把字段重新组合回low和high。QuickDecodeDecompositionCheck4x4x4、QuickDecodeDecompositionCheck7x3x6和OpTypeBitmask同时限制字段宽度和opcode family flags。
+cs/src/machine/decoder/decode_optimized_must_handle_csr.rs::OptimizedDecoder::decode登机**decoder约束(2.6.3)**。decoder输入是Register([low, high])，也就是取指得到的两个16-bit limb。它从low/high里切出opcode、imm4_1、funct3、rs1_low、rs1_high、rs2_high、imm10_5、sign_bit，并用代数约束把字段重新组合回low和high。QuickDecodeDecompositionCheck4x4x4检查imm4_1、rs1_high、rs2_high分别是4-bit，QuickDecodeDecompositionCheck7x3x6检查opcode、funct3、imm10_5分别是7-bit、3-bit、6-bit。
 
 ```text
 low == opcode + 2^7 * imm11 + 2^8 * imm4_1 + 2^12 * funct3 + 2^15 * rs1_low
@@ -1395,23 +1399,37 @@ high == rs1_high + 2^4 * rs2_low + 2^5 * rs2_high + 2^9 * imm10_5 + 2^15 * sign_
 
 [imm4_1, rs1_high, rs2_high] ∈ rows(QuickDecodeDecompositionCheck4x4x4)
 [opcode, funct3, imm10_5] ∈ rows(QuickDecodeDecompositionCheck7x3x6)
-lookup_OpTypeBitmask(table_input) == (splitting_0, splitting_1)
+```
 
+源码通过low/high减去已知字段后解出imm11和rs2_low，再添加**boolean约束**，保证这两个剩余字段确实是1-bit。
+
+```
 imm11 * (imm11 - 1) == 0
 rs2_low * (rs2_low - 1) == 0
 ```
 
+OpTypeBitmask根据opcode、funct3、funct7生成opcode family flags和variant bits。decoder先构造：
+
+```
+funct7 = sign_bit * 2^6 + imm10_5
+table_input = opcode + 2^7  * funct3 + 2^10 * funct7
+```
+
+然后把table_input和两个由boolean bits组成的splitting字段登记为**OpTypeBitmask lookup**，约束当前instruction属于某个合法opcode family。
+
+```
+lookup_OpTypeBitmask(table_input) == (splitting_0, splitting_1)
+```
+
 trusted code配置添加invalid_opcode清零约束invalid_opcode==0。
 
-opcode family约束由exec_flag门控，f
-
-amily函数生成候选rd、候选next_pc、load/store地址和值、CSR request字段。exec_flag==1时对应family表达式生效，exec_flag==0时该family表达式不限制当前行。
+**opcode family约束**由exec_flag门控，每个family函数生成自己的候选rd、候选next_pc、load/store地址和值、CSR request字段。exec_flag==1时对应family表达式生效，exec_flag==0时该family表达式不限制当前行。
 
 ```text
 exec_flag * family_expr == 0
 ```
 
-CSR约束查询SpecialCSRProperties。当前行执行CSR时，is_supported_csr必须为1；delegation CSR会启用request并清零ExternalOracle返回值。
+**CSR约束**查询SpecialCSRProperties。当前行执行CSR时，is_supported_csr必须为1。若CSR属于delegation CSR，电路会启用delegation request，并把ExternalOracle返回值清零。
 
 ```text
 lookup_SpecialCSRProperties(csr_index) == (is_supported_csr, is_for_delegation)
@@ -1425,7 +1443,7 @@ is_for_delegation * oracle_low == 0
 is_for_delegation * oracle_high == 0
 ```
 
-opt_ctx.enforce_all把family函数暂存的add/sub、lookup、is_zero关系写入BasicAssembly。add/sub关系按exec_flag选择候选a、b、c，再生成低16位和高16位加法约束。
+**opt_ctx.enforce_all**把family函数暂存的add/sub、lookup、is_zero关系写入BasicAssembly，比如add/sub关系按exec_flag选择候选a、b、c，再生成低16位和高16位加法约束。
 
 ```text
 a_eff = Σ flag_i * a_i
@@ -1436,7 +1454,7 @@ a_eff_low + b_eff_low - c_eff_low - 2^16 * carry == 0
 a_eff_high + b_eff_high - c_eff_high + carry - 2^16 * carry_out == 0
 ```
 
-lookup关系按exec_flag选择row和table id。
+**lookup约束**同样按exec_flag选择当前row实际生效的row和table id，被选中的row_eff作为lookup输入，table_eff决定查询哪张固定表。
 
 ```text
 row_eff[j] = Σ flag_i * row_i[j]
@@ -1444,17 +1462,16 @@ table_eff = Σ flag_i * table_i
 [row_eff[0], row_eff[1], row_eff[2]] ∈ rows(table_eff)
 ```
 
-is_zero关系把两个16-bit limb合并成sum，用inverse辅助变量和is_zero约束零判断。
+**is_zero约束**把两个16-bit limb合并成sum，用inverse和is_zero约束零判断。sum为0时is_zero可以为1，sum非0时inverse必须是sum的逆元，is_zero只能为0。
 
 ```text
-sum = reg_low + reg_high
-not_zero = 1 - is_zero
+sum = reg_low + reg_high， not_zero = 1 - is_zero
 
 inv * sum - not_zero == 0
 is_zero * sum == 0
 ```
 
-writeback约束选择最终rd和最终pc。update_rd控制slot2是否写寄存器，rd=x0时写回值被清零，B格式branch把slot2清空。
+**writeback约束**选择最终rd和最终pc。update_rd控制slot2是否写寄存器，rd=x0时写回值被清零，B格式branch写rd，因此slot2被清空。最终pc写入final_state.pc。
 
 ```text
 update_rd = r_insn + i_insn + u_insn + j_insn
@@ -1475,7 +1492,7 @@ b_insn * slot2_value_high == 0
 final_state.pc == new_pc
 ```
 
-shuffle RAM登记约束把slot0、slot1、slot2写入BasicAssembly.shuffle_ram_queries。describe_state_transition只登记query内容和slot顺序，compile_inner再检查main路径的query数量和slot形状。
+**shuffle RAM登记约束**把slot0、slot1、slot2应的寄存器/RAM访问写入BasicAssembly.shuffle_ram_queries。describe_state_transition只登记query访问类型、read_value、write_value和local_timestamp_in_cycle，compile_inner后续会检查main路径是否固定登记3个query，并验证slot顺序和slot形状是否符合main RISC-V执行约定。
 
 ```text
 slot0 = rs1 register read
@@ -1620,55 +1637,7 @@ add_table_with_content出现过两次：
 - compile_inner之后:
   get_table_driver_for_rom_bound把RomRead和SpecialCSRProperties补进独立TableDriver，SetupPrecomputations后续调用dump_tables写setup trace。
 
-dump_tables只发生在SetupPrecomputations::get_main_domain_trace里，时间在compile_inner之后。
-
-```rust
-// cs/src/tables.rs
-impl<F: PrimeField> TableDriver<F> {
-    pub fn add_table_with_content(&mut self, table_type: TableType, table: LookupWrapper<F>) {
-        let id = table.get_table_id() as usize;
-        assert_eq!(id, table_type.to_table_id() as usize);
-
-        if self.tables[id].is_initialized() {
-            return;
-        }
-
-        let table_size = table.get_size();
-        self.tables[id] = table;
-        self.total_tables_len += table_size;
-        self.update_table_offsets();
-    }
-
-    pub fn materialize_table(&mut self, table_type: TableType) {
-        static CACHE: LazyLock<Mutex<TypeMap>> = LazyLock::new(|| Mutex::new(TypeMap::default()));
-
-        let mut guard = CACHE.lock().unwrap();
-        let map = guard
-            .entry()
-            .or_insert_with(HashMap::<TableType, LookupWrapper<F>>::new);
-
-        let wrapper = map
-            .entry(table_type)
-            .or_insert_with(|| table_type.generate_table::<F>());
-        let table = wrapper.clone();
-        self.add_table_with_content(table_type, table);
-    }
-
-    pub fn dump_tables(&self) -> Vec<[F; 4]> {
-        let mut result = Vec::with_capacity(self.total_tables_len);
-        for table in self.tables.iter() {
-            if table.get_size() == 0 {
-                continue;
-            }
-            let id = table.get_table_id();
-            table.dump_into(&mut result, Some(id));
-        }
-        result
-    }
-}
-```
-
-dump_tables按TableType id顺序遍历已初始化表，把每张表dump成宽度4的行。common width是3，额外一列是table id。RomRead行在setup trace中以统一generic lookup格式出现，形如rom_address、low、high、RomRead_table_id。
+dump_tables只发生在SetupPrecomputations::get_main_domain_trace里，时间在compile_inner之后，按TableType id顺序遍历已初始化表，把每张表dump成宽度4的行，在原来common width为3的基础上额外加一列表示table id。比如RomRead行在setup trace中以统一generic lookup格式出现，形如[rom_address、low、high、RomRead_table_id]。
 
 ## 3. compile_inner生成CompiledCircuitArtifact
 
@@ -1992,11 +1961,10 @@ address还要区分register地址空间和RAM地址空间。RegisterOnly表示�
 
 ```text
 RegisterOnly:
-  address_contribution = 1 + alpha_addr_low * register_index
+address_contribution = 1 + alpha_addr_low * register_index
 
 RegisterOrRam:
-  address_contribution =
-    is_register + alpha_addr_low * address_low + alpha_addr_high * address_high
+address_contribution = is_register + alpha_addr_low * address_low + alpha_addr_high * address_high
 
 is_register * (is_register - 1) == 0
 ```
@@ -2052,8 +2020,7 @@ TimestampRangeCheck:
   v ∈ rows(TimestampRangeCheck)
 
 Generic lookup:
-  multiplicity_generic(table_row) ==
-    count(row k where lookup_row(k) == table_row)
+  multiplicity_generic(table_row) == count(row k where lookup_row(k) == table_row)
   table_row ∈ rows(RomRead ∪ OpTypeBitmask ∪ SpecialCSRProperties ∪ ...)
 ```
 
@@ -2214,23 +2181,23 @@ for lookup_query in lookups {
 >
 > 举例此处compile_inner做的转换是：
 >
+> ```
 > Variable级lookup query:
->
 > row = [
 > LookupInput::Variable(pc),
 > LookupInput::Variable(instruction_low),
 > LookupInput::Variable(instruction_high)
 > ]
 > table = RomRead
->
+> 
 > 转换后：
->
 > input_columns = [
 > LookupExpression::Variable(ColumnAddress(pc_col)),
 > LookupExpression::Variable(ColumnAddress(low_col)),
 > LookupExpression::Variable(ColumnAddress(high_col))
 > ]
 > table_index = TableIndex::Constant(RomRead)
+> ```
 
 常见固定表lookup：
 
@@ -2535,46 +2502,23 @@ compile_inner最后返回CompiledCircuitArtifact，保存compile_inner生成的�
 
 字段含义：
 
-```text
-witness_layout:
-  WitnessSubtree列布局、lookup query输入列、range check表达式和multiplicity列位置。
-
-memory_layout:
-  MemorySubtree列布局，包括shuffle RAM、lazy init和teardown相关列。
-
-setup_layout:
-  setup trace列布局，包括timestamp表、RangeCheck16表、TimestampRangeCheck表和generic lookup固定表列范围。
-
-stage_2_layout:
-  stage 2 trace列布局。compile_inner只分配列范围，不计算stage 2中间值。
-
-degree_1_constraints / degree_2_constraints:
-  ColumnAddress级普通AIR约束。每个Variable已经被替换成ColumnAddress。
-
-state_linkage_constraints / public_inputs:
-  相邻行状态连接关系、初始状态边界和最终状态边界。
-
-table_offsets / total_tables_size:
-  generic lookup合并固定表的TableType起始offset和总长度。
-
-variable_mapping:
-  Variable到ColumnAddress的映射。
-
-scratch_space_size_for_witness_gen:
-  OptimizedOut变量需要的临时计算空间大小。
-
-lazy_init_address_aux_vars:
-  lazy init地址排序辅助变量的列位置。
-
-memory_queries_timestamp_comparison_aux_vars:
-  shuffle RAM timestamp比较辅助变量的列位置。
-```
+- witness_layout: WitnessSubtree列布局、lookup query输入列、range check表达式和multiplicity列位置。
+- memory_layout: MemorySubtree列布局，包括shuffle RAM、lazy init和teardown相关列。
+- setup_layout: setup trace列布局，包括timestamp表、RangeCheck16表、TimestampRangeCheck表和generic lookup固定表列范围。
+- stage_2_layout: stage 2 trace列布局。compile_inner只分配列范围，不计算stage 2中间值。
+- degree_1_constraints / degree_2_constraints: ColumnAddress级普通AIR约束。每个Variable已经被替换成ColumnAddress。
+- state_linkage_constraints / public_inputs: 相邻行状态连接关系、初始状态边界和最终状态边界。
+- table_offsets / total_tables_size: generic lookup合并固定表的TableType起始offset和总长度。
+- variable_mapping: Variable到ColumnAddress的映射。
+- scratch_space_size_for_witness_gen: OptimizedOut变量需要的临时计算空间大小。
+- lazy_init_address_aux_vars: lazy init地址排序辅助变量的列位置。
+- memory_queries_timestamp_comparison_aux_vars: shuffle RAM timestamp比较辅助变量的列位置。
 
 ### 3.11 compile_inner约束汇总
 
 compile_inner接收CircuitOutput，返回CompiledCircuitArtifact。CircuitOutput里的约束仍使用Variable编号，在本函数里转换成ColumnAddress级布局和约束描述。
 
-main路径形状检查发生在布局前。compile_inner::<false>要求main RISC-V只有3个shuffle RAM query，不处理delegation circuit内部的batched memory和register-indirect访问。
+main路径形状检查发生在布局前。compile_inner::<false>要求main RISC-V**只有3个shuffle RAM query**，不处理delegation circuit内部的batched memory和register-indirect访问。
 
 ```text
 shuffle_ram_queries.len() == 3
@@ -2591,7 +2535,7 @@ lookup_table_encoding_capacity = trace_len - 1
 num_generic_lookup_setup_column_groups = ceil(total_tables_size / (trace_len - 1))
 ```
 
-state linkage把一行的输出状态连接到下一行输入状态：main RISC-V当前状态是pc，public input记录执行段起点和终点。
+**state linkage把一行的输出状态连接到下一行输入状态**：main RISC-V当前状态是pc，public input记录执行段起点和终点。
 
 ```text
 pc_out(row k) == pc_in(row k + 1)
@@ -2599,20 +2543,20 @@ public_pc_start == pc_in(first row)
 public_pc_end == pc_out(one-before-last row)
 ```
 
-boolean约束来自describe_state_transition登记的selector、flag、carry、is_register，也来自compile_inner新增的timestamp borrow和lazy init borrow。这些变量分配WitnessSubtree列，并生成degree 2约束。
+**boolean约束**来自describe_state_transition登记的selector、flag、carry、is_register，也来自compile_inner新增的timestamp borrow和lazy init borrow。这些变量分配WitnessSubtree列，并生成degree 2约束。
 
 ```text
 b * (b - 1) == 0
 ```
 
-selector门控约束已经在describe_state_transition进入CircuitOutput.constraints，compile_inner把它们从Variable级编译成ColumnAddress级degree约束。
+**selector门控约束**已经在describe_state_transition进入CircuitOutput.constraints，compile_inner把它们从Variable级编译成ColumnAddress级degree约束。
 
 ```text
 s * expr == 0
 s * (s - 1) == 0
 ```
 
-range check约束8-bit成对进入RangeCheckSmall width-3 lookup，16-bit进入range_check_16_lookup_expressions，timestamp比较和lazy init排序产生的tmp表达式也加入16-bit range check列表。
+**range check约束**8-bit成对进入RangeCheckSmall width-3 lookup，16-bit进入range_check_16_lookup_expressions，timestamp比较和lazy init排序产生的tmp表达式也加入16-bit range check列表。
 
 ```text
 [a, b, 0] ∈ rows(RangeCheckSmall)
@@ -2623,7 +2567,7 @@ v ∈ rows(RangeCheck16)
 0 <= v < 2^16
 ```
 
-width-3 lookup来自CircuitOutput.lookups。compile_inner把LookupInput::Variable替换成LookupExpression::Variable(ColumnAddress)，把LookupInput::Expression编译成CompiledDegree1Constraint。
+**width-3 lookup**来自CircuitOutput.lookups。compile_inner把LookupInput::Variable替换成LookupExpression::Variable(ColumnAddress)，把LookupInput::Expression编译成CompiledDegree1Constraint。
 
 ```text
 lookup_RomRead(rom_address) == (low, high)
@@ -2634,7 +2578,7 @@ num_total_generic_lookup_queries = width_3_lookups.len * trace_len
 num_total_generic_lookup_queries < field_characteristic
 ```
 
-timestamp比较约束来自3个shuffle RAM query。compile_inner把read_timestamp < write_timestamp拆成low/high两个TimestampRangeCheck表达式，write_low/write_high来自SetupSubtree的timestamp_setup_columns，read_low/read_high来自MemorySubtree。
+**timestamp比较约束**来自3个shuffle RAM query。compile_inner把read_timestamp < write_timestamp拆成low/high两个TimestampRangeCheck表达式，write_low/write_high来自SetupSubtree的timestamp_setup_columns，read_low/read_high来自MemorySubtree。
 
 ```text
 read_timestamp = read_low + 2^ts_bits * read_high
@@ -2651,7 +2595,7 @@ num_total_timestamp_range_check_queries = compiled_timestamp_comparison_expressi
 num_total_timestamp_range_check_queries < field_characteristic
 ```
 
-lazy init地址排序约束比较相邻lazy init地址：tmp_low/tmp_high进入RangeCheck16，borrow/final_borrow进入boolean约束，而final_borrow==0时当前行被约束成padding行。
+**lazy init地址排序约束**比较相邻lazy init地址：tmp_low/tmp_high进入RangeCheck16，borrow/final_borrow进入**boolean约束**，而final_borrow==0时当前行被**约束成padding行**。
 
 ```text
 addr(k) = addr_low(k) + 2^16 * addr_high(k)
@@ -2679,7 +2623,7 @@ a * x + Σ b_i * y_i + c == 0
 x = -(Σ b_i * y_i + c) / a
 ```
 
-普通constraints编译把Variable级约束换成ColumnAddress级约束。约束含义不变，取值地址改变。
+普通constraints编译把Variable级约束换成ColumnAddress级约束，含义不变但取值地址改变。
 
 ```text
 Variable约束：Σ q_ij * v_i * v_j + Σ a_i * v_i + c == 0
@@ -2705,77 +2649,15 @@ num_generic_lookup_stage2_polys = witness_layout.width_3_lookups.len
 
 ### 4.1 Twiddles和LdePrecomputations
 
-Twiddles和LdePrecomputations在get_main_riscv_circuit_setup创建，随后被SetupPrecomputations::from_tables_and_trace_len消费。
+Twiddles和LdePrecomputations在get_main_riscv_circuit_setup创建，作为FFT/LDE预计算数据被SetupPrecomputations::from_tables_and_trace_len消费。
 
-```rust
-// circuit_defs/setups/src/circuits/main_riscv/mod.rs
-let twiddles: Twiddles<_, A> = Twiddles::new(::risc_v_cycles::DOMAIN_SIZE, &worker);
-
-let lde_precomputations = LdePrecomputations::new(
-    ::risc_v_cycles::DOMAIN_SIZE,
-    ::risc_v_cycles::LDE_FACTOR,
-    ::risc_v_cycles::LDE_SOURCE_COSETS,
-    &worker,
-);
-```
-
-Twiddles::new接收domain_size和worker，创建forward_twiddles、inverse_twiddles、omega、omega_inv和FFT相关预计算。LdePrecomputations::new接收domain_size、lde_factor、source_cosets和worker，为source_cosets中的每个coset创建DomainBoundLdePrecomputations。
+Twiddles::new接收domain_size（FFT域大小）和worker，预计算主域FFT/IFFT会反复用到的twiddle powers、omega和omega_inv。LdePrecomputations::new接收domain_size、lde_factor、source_cosets和worker，预计算LDE时需要的coset powers、缩放因子和bitreversed powers。
 
 ### 4.2 from_tables_and_trace_len
 
-文件：prover/src/prover_stages/mod.rs
-
-get_main_riscv_circuit_setup调用SetupPrecomputations::from_tables_and_trace_len。输入包括独立table_driver、DOMAIN_SIZE、machine.setup_layout、twiddles、lde_precomputations、LDE_FACTOR、TREE_CAP_SIZE和worker。
-
-```rust
-// prover/src/prover_stages/mod.rs
-impl<const N: usize, A: GoodAllocator, T: MerkleTreeConstructor> SetupPrecomputations<N, A, T> {
-    pub fn from_tables_and_trace_len(
-        table_driver: &TableDriver<Mersenne31Field>,
-        trace_len: usize,
-        setup_layout: &SetupLayout,
-        twiddles: &Twiddles<Mersenne31Complex, A>,
-        lde_precomputations: &LdePrecomputations<A>,
-        lde_factor: usize,
-        _tree_cap_size: usize,
-        worker: &Worker,
-    ) -> Self {
-        assert!(trace_len.is_power_of_two());
-
-        let optimal_folding =
-            crate::definitions::OPTIMAL_FOLDING_PROPERTIES[trace_len.trailing_zeros() as usize];
-        let subtree_cap_size = (1 << optimal_folding.total_caps_size_log2) / lde_factor;
-
-        let mut main_domain_trace =
-            Self::get_main_domain_trace(table_driver, trace_len, setup_layout, worker);
-
-        adjust_to_zero_c0_var_length(&mut main_domain_trace, 0..setup_layout.total_width, worker);
-
-        let ldes = compute_wide_ldes(
-            main_domain_trace,
-            twiddles,
-            lde_precomputations,
-            0,
-            lde_factor,
-            worker,
-        );
-
-        let mut trees = Vec::with_capacity(lde_factor);
-        for domain in ldes.iter() {
-            let tree = T::construct_for_coset(&domain.trace, subtree_cap_size, true, worker);
-            trees.push(tree);
-        }
-
-        Self { ldes, trees }
-    }
-}
-```
-
-from_tables_and_trace_len检查trace_len是2的幂，计算subtree_cap_size，调用get_main_domain_trace生成setup main-domain trace，调用adjust_to_zero_c0_var_length处理最后一行相关约束，调用compute_wide_ldes生成LDE，再为每个LDE coset构造Merkle tree。返回值只包含ldes和trees。
+from_tables_and_trace_len检查trace_len是2的幂，计算subtree_cap_size，调用get_main_domain_trace生成setup main-domain trace，调用adjust_to_zero_c0_var_length处理最后一行相关约束，调用compute_wide_ldes生成LDE，再为每个LDE coset构造Merkle tree。
 
 ### 4.3 get_main_domain_trace
-
-文件：prover/src/prover_stages/mod.rs
 
 get_main_domain_trace把独立TableDriver中的固定表内容写入setup trace。
 
@@ -2789,102 +2671,83 @@ pub fn get_main_domain_trace(
 ) -> RowMajorTrace<Mersenne31Field, { N }, A> {
     let main_domain_trace =
         RowMajorTrace::new_zeroed_for_size(trace_len, setup_layout.total_width, A::default());
-
     let table_encoding_capacity_per_tuple = trace_len - 1;
-
     let mut num_table_subsets =
         table_driver.total_tables_len / table_encoding_capacity_per_tuple;
     if table_driver.total_tables_len % table_encoding_capacity_per_tuple != 0 {
         num_table_subsets += 1;
     }
-
     assert_eq!(
         num_table_subsets,
         setup_layout.generic_lookup_setup_columns.num_elements()
     );
-
     let all_generic_tables = table_driver.dump_tables();
     assert_eq!(all_generic_tables.len(), table_driver.total_tables_len);
-
     let range_check_16_table: Vec<_> = (0..(1 << 16))
         .map(|el| Mersenne31Field(el as u32))
         .collect();
-
     let timestamp_range_check_table: Vec<_> = (0..(1 << TIMESTAMP_COLUMNS_NUM_BITS))
         .map(|el| Mersenne31Field(el as u32))
         .collect();
-
     let generic_tables_chunks: Vec<_> = all_generic_tables
         .chunks(table_encoding_capacity_per_tuple)
         .collect();
     // 省略代码...
-
-    worker.scope(trace_len - 1, |scope, geometry| {
-        // 省略代码...
-    });
-
     main_domain_trace
 }
 ```
 
-table_driver.dump_tables dump的是固定表内容。RomRead表内容能进入setup trace，是因为get_table_driver_for_rom_bound已经把RomRead加入独立TableDriver。dump结果包括RomRead、OpTypeBitmask、SpecialCSRProperties、RomAddressSpaceSeparator和其它固定表。
-
-写行代码如下。
-
-```rust
-// prover/src/prover_stages/mod.rs
-// 省略代码...
-for i in 0..chunk_size {
-    let absolute_row_idx = chunk_start + i;
-    let trace_view_row = trace_view.current_row();
-    // 省略代码...
-    if absolute_row_idx < range_check_16_table_content_len {
-        trace_view_row[setup_layout.range_check_16_setup_column.start()] =
-            range_check_16_table_content_ref[absolute_row_idx];
-    }
-
-    if absolute_row_idx < timestamp_range_check_table_content_len {
-        trace_view_row[setup_layout.timestamp_range_check_setup_column.start()] =
-            timestamp_range_check_table_content_ref[absolute_row_idx];
-    }
-
-    for (tuple_idx, encoding_chunk) in all_generic_tables_ref.iter().enumerate() {
-        if absolute_row_idx < encoding_chunk.len() {
-            let table_row = encoding_chunk[absolute_row_idx];
-            let range = setup_layout
-                .generic_lookup_setup_columns
-                .get_range(tuple_idx);
-            trace_view_row[range].copy_from_slice(&table_row);
-        }
-    }
-
-    if setup_layout.timestamp_setup_columns.num_elements() > 0 {
-        let timestamp = (absolute_row_idx as u64) + 1;
-        let timestamp_shifted = timestamp << NUM_EMPTY_BITS_FOR_RAM_TIMESTAMP;
-        let timestamp_low =
-            timestamp_shifted & ((1 << TIMESTAMP_COLUMNS_NUM_BITS) - 1);
-        let timestamp_high = timestamp_shifted >> TIMESTAMP_COLUMNS_NUM_BITS;
-
-        trace_view_row[setup_layout.timestamp_setup_columns.start()] =
-            Mersenne31Field(timestamp_low as u32);
-        trace_view_row[setup_layout.timestamp_setup_columns.start() + 1] =
-            Mersenne31Field(timestamp_high as u32);
-    }
-
-    trace_view.advance_row();
-}
-// 省略代码...
-```
+table_driver.dump_tables dump的是固定表内容，包括RomRead、OpTypeBitmask、SpecialCSRProperties、RomAddressSpaceSeparator和其它固定表。
 
 get_main_domain_trace遍历setup trace前trace_len - 1行。每行按列布局写入range_check_16_setup_column、timestamp_range_check_setup_column、generic_lookup_setup_columns和timestamp_setup_columns。最后一行不在worker.scope(trace_len - 1)范围内，后续adjust_to_zero_c0_var_length处理。
 
-setup trace初始全零。固定表内容没有写到的位置保持0。这与RomRead表内部UNIMP_OPCODE padding不同：UNIMP_OPCODE padding决定RomRead表的opcode value；setup trace zero padding只发生在setup trace矩阵未写入的位置。
-
-setup trace不包含guest某一行执行值。RomRead表内容进入setup trace，是因为独立TableDriver保存了当前bytecode生成的RomRead表，而get_main_domain_trace调用table_driver.dump_tables。
+```rust
+    for i in 0..chunk_size {
+        let absolute_row_idx = chunk_start + i;
+        let trace_view_row = trace_view.current_row();
+        // 如果当前行号小于2^16，写入16-bit range table：
+        if absolute_row_idx < range_check_16_table_content_len {
+            trace_view_row[setup_layout.range_check_16_setup_column.start()] =
+                range_check_16_table_content_ref[absolute_row_idx];
+        }
+        // 如果当前行号小于timestamp range表长度，写timestamp range table
+        if absolute_row_idx < timestamp_range_check_table_content_len {
+            trace_view_row
+                [setup_layout.timestamp_range_check_setup_column.start()] =
+                timestamp_range_check_table_content_ref[absolute_row_idx];
+        }
+        // 对每个generic table chunk，如果当前行号还在chunk范围内，就取出一行table row，并写入对应的generic lookup columns：
+        // 把拼好的lookup表内容分块写进generic_lookup_setup_columns，每一块最多写trace_len - 1行，因为最后一行不用。
+        for (tuple_idx, encoding_chunk) in all_generic_tables_ref.iter().enumerate()
+        {
+            if absolute_row_idx < encoding_chunk.len() {
+                let table_row = encoding_chunk[absolute_row_idx];
+                let range = setup_layout
+                    .generic_lookup_setup_columns
+                    .get_range(tuple_idx);
+                trace_view_row[range].copy_from_slice(&table_row);
+            }
+        }
+        // 如果setup layout里有timestamp setup columns，还写timestamp：
+        // 这些timestamp列服务shuffle RAM argument。
+        if setup_layout.timestamp_setup_columns.num_elements() > 0 {
+            let timestamp = (absolute_row_idx as u64) + 1;
+            let timestamp_shifted = timestamp << NUM_EMPTY_BITS_FOR_RAM_TIMESTAMP;
+            let timestamp_low =
+                timestamp_shifted & ((1 << TIMESTAMP_COLUMNS_NUM_BITS) - 1);
+            let timestamp_high = timestamp_shifted >> TIMESTAMP_COLUMNS_NUM_BITS;
+            trace_view_row[setup_layout.timestamp_setup_columns.start()] =
+                Mersenne31Field(timestamp_low as u32);
+            trace_view_row[setup_layout.timestamp_setup_columns.start() + 1] =
+                Mersenne31Field(timestamp_high as u32);
+        }
+        trace_view.advance_row();
+    }
+```
 
 ### 4.4 setup trace一致性检查
 
-SetupPrecomputations::from_tables_and_trace_len和get_main_domain_trace包含若干源码检查。这些检查属于setup trace生成阶段。CompiledCircuitArtifact.degree_1_constraints和degree_2_constraints不保存这些检查。
+SetupPrecomputations::from_tables_and_trace_len和get_main_domain_trace包含若干setup trace生成阶段的源码检查：
 
 from_tables_and_trace_len先检查trace_len形状。
 
@@ -2892,7 +2755,7 @@ from_tables_and_trace_len先检查trace_len形状。
 trace_len.is_power_of_two() == true
 ```
 
-get_main_domain_trace根据独立TableDriver.total_tables_len计算generic table需要多少组setup列，并检查这个数量等于SetupLayout.generic_lookup_setup_columns.num_elements()。这个检查把compile_inner生成的SetupLayout和独立TableDriver的真实表内容长度对齐。
+get_main_domain_trace根据传入的TableDriver.total_tables_len计算generic lookup固定表需要多少组setup column group，每组列最多写入trace_len - 1条表记录，相当于把compile_inner生成的SetupLayout和当前TableDriver里的真实固定表长度对齐。compile_inner只根据table_driver.total_tables_len预先分配列组；get_main_domain_trace则拿真实表内容执行dump_tables，并按trace_len - 1切成多个chunk，分别写入setup_layout.generic_lookup_setup_columns对应的列组。
 
 ```text
 table_encoding_capacity_per_tuple = trace_len - 1
@@ -2901,7 +2764,7 @@ num_table_subsets = ceil(table_driver.total_tables_len / (trace_len - 1))
 num_table_subsets == setup_layout.generic_lookup_setup_columns.num_elements()
 ```
 
-dump_tables长度检查保证TableDriver声明的总长度和实际dump出的固定表行数一致。
+dump_tables检查TableDriver声明的总长度和实际dump出的固定表行数一致。
 
 ```text
 all_generic_tables = table_driver.dump_tables()
@@ -2927,11 +2790,13 @@ timestamp_shifted = timestamp << NUM_EMPTY_BITS_FOR_RAM_TIMESTAMP
 timestamp_setup_columns = (timestamp_low, timestamp_high)
 ```
 
-setup trace初始全零。range table、timestamp table或generic table没有覆盖的位置保持0。这个zero padding只描述setup trace矩阵的未写入位置；RomRead表内部的UNIMP_OPCODE padding描述ROM地址对应的opcode内容。
+> [!TIP]
+>
+> setup trace初始全零，range table、timestamp table或generic table没有覆盖的位置保持0。这与RomRead表内部UNIMP_OPCODE padding不同：这个zero padding只描述setup trace矩阵的未写入位置；RomRead表内部的UNIMP_OPCODE padding描述ROM地址对应的opcode内容。
 
-setup trace一致性检查只保证固定表行、SetupLayout列组和trace长度匹配。它不登记CPU状态转移约束，不写入CompiledCircuitArtifact约束字段。
+setup trace一致性检查作用是保证固定表行、SetupLayout列组和trace长度匹配。
 
-## 5. setup和witness分界
+## 5. setup收尾
 
 get_main_riscv_circuit_setup结束时，setup层已经生成以下对象：
 
@@ -2941,7 +2806,3 @@ get_main_riscv_circuit_setup结束时，setup层已经生成以下对象：
 4. lde_precomputations：LDE domain/coset预计算。
 5. setup：SetupPrecomputations，包含setup trace的LDE结果和Merkle trees。
 6. witness_eval_fn_for_gpu_tracer：函数指针，后续witness阶段调用。
-
-witness阶段从运行guest开始。trace_execution_for_gpu生成CycleData；MainRiscVOracle读取CycleData；evaluate_witness调用witness_eval_fn_for_gpu_tracer，根据CompiledCircuitArtifact.variable_mapping和witness_layout写witness trace。setup阶段不产生CycleData，不填写pc、寄存器值、memory read/write value。
-
-prove阶段从prover_stages::prove开始，消费compiled_circuit、public_inputs、witness trace、setup_precomputations、twiddles和lde_precomputations。
