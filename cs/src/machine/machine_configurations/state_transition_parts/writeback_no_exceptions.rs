@@ -37,6 +37,8 @@ pub(crate) fn writeback_no_exception_with_opcodes_in_rom<
             // we do not care about predicating state updates below, because if trap happens it's already unsatisfiable circuit
 
             // 从所有opcode family返回的rd候选值里选出真正执行的那个。
+            // rd_final_low  = is_add * res_low + is_sub * sub_res_low + is_load * load_low + ...
+            // rd_final_high = is_add * res_high + ...
             let new_reg_val = CommonDiffs::select_final_rd_value(cs, &application_results);
 
             // if we will not update register and do not execute memory store, then
@@ -46,16 +48,24 @@ pub(crate) fn writeback_no_exception_with_opcodes_in_rom<
 
             // opcode formats are orthogonal flags, so a boolean to update RD is just a linear combination
             // R / I / J / U格式会写rd，B格式不写rd。
+            // 这是 instruction format flag，不是 opcode family flag：
+            // - R-type ADD：r_insn=1 → update_rd=1
+            // - B-type branch：update_rd=0（不写 rd）
+            // - S-type store：update_rd=0（写 RAM 不写 rd）
             let update_rd = Constraint::from(r_insn.get_variable().unwrap())
                 + Constraint::from(i_insn.get_variable().unwrap())
                 + Constraint::from(j_insn.get_variable().unwrap())
                 + Constraint::from(u_insn.get_variable().unwrap());
 
             // rd本身来自decoder输出；如果rd = x0，则写回值会被mask成0，符合RISC-V的x0规则。
+            // writeback 里 `rd` 是 decoder 给出的**寄存器编号**（ADD 行为 5），不是寄存器里的值 16。`is_zero(rd)` 判断「编号是否为 0」。
             let rd = cs.add_variable_from_constraint_allow_explicit_linear(rd_constraint.clone());
             let reg_is_zero = cs.is_zero(Num::Var(rd));
             // we ALWAYS write to register (with maybe modified value), unless we write to RAM, except for B-format opcodes (
             // that are modeled as write 0 to x0)
+
+            // (rd - 0) * zero_flag = 0
+            // (rd - 0) * var_inv = 1 - zero_flag
 
             // Mask to get 0s if we write into x0
             let reg_write_value_low = cs.add_variable_from_constraint(
@@ -79,6 +89,7 @@ pub(crate) fn writeback_no_exception_with_opcodes_in_rom<
                 panic!("Memory opcode must resolve RD/STORE query `is_register` flag");
             };
             // if we write to RD - we should make a constraint over the address, that it comes from opcode
+            // 约束形如 update_rd * (期望值 - 实际变量) = 0：update_rd=0 时不强制（STORE 走另一路径改 slot2）。
             cs.add_constraint((rd_constraint.clone() - Term::from(address[0])) * update_rd.clone());
             cs.add_constraint((Term::from(address[1])) * update_rd.clone());
             // x0 for BRANCH instructions as it's not even encoded in the opcode
@@ -105,6 +116,10 @@ pub(crate) fn writeback_no_exception_with_opcodes_in_rom<
             );
 
             // 把预分配好的三个query正式登记进CircuitOutput.shuffle_ram_queries。
+            // 写入 CircuitOutput
+            // 还不能单独证明「x1 在上一时刻之后确实等于 7」或「下一行读 x5 会看到 16」。
+            // 跨行、同地址读写顺序一致性由 shuffle RAM memory argument（后续章节）处理。
+            // add_shuffle_ram_query 是把「本行声称发生了这些访问」登记进 trace，不是普通 add_constraint。
             cs.add_shuffle_ram_query(rs1_query);
             cs.add_shuffle_ram_query(rs2_or_mem_load_query);
             cs.add_shuffle_ram_query(rd_or_mem_store_query);

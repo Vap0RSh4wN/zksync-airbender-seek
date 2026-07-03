@@ -19,6 +19,7 @@ use core::array::from_fn;
 
 use super::risc_v_types::ExecutorOperation;
 
+/// 在 `exec_flag=1` 时，要求三元组 `(a, b, c)` 满足一条加减法关系。对加法，这句话是 `a + b = c`；对减法，源码把关系改写成 `c + b = a`，仍然落回同一套加法约束。
 struct AddSubRelation<F: PrimeField> {
     exec_flag: Boolean,
     a: Register<F>,
@@ -129,6 +130,16 @@ pub struct OptimizationContext<F: PrimeField, C: Circuit<F>> {
 }
 
 impl<F: PrimeField, CS: Circuit<F>> OptimizationContext<F, CS> {
+    // 同一个 family 里有两个互斥分支，但它们要共用同一批槽位”。
+    // 例如：
+    // 先记住当前 indexer 状态
+    // 分支 A 登记几条关系
+    // 恢复 indexer
+    // 分支 B 登记对应几条关系
+    // 这样分支 A 和分支 B 会落到同样的 index 上，后面再靠各自 flag 选择。
+    // 所以：
+    // reset_indexers：让不同 family 对齐到相同起点
+    // save/restore：让同一 family 的不同分支对齐到相同起点
     pub fn save_indexers(&self) -> OptCtxIndexers {
         self.indexers
     }
@@ -568,6 +579,7 @@ impl<F: PrimeField, CS: Circuit<F>> OptimizationContext<F, CS> {
         let res = self.get_register_output(cs);
 
         assert!(self.indexers.add_sub_indexer <= self.add_sub_ofs.len());
+        // 从 add_sub_ofs 池取或新建
         let of_flag = if self.indexers.add_sub_indexer < self.add_sub_ofs.len() {
             self.add_sub_ofs[self.indexers.add_sub_indexer]
         } else {
@@ -599,6 +611,7 @@ impl<F: PrimeField, CS: Circuit<F>> OptimizationContext<F, CS> {
         self.indexers.add_sub_indexer += 1;
 
         use crate::cs::utils::check_constants;
+        // `check_constants` 判断操作数是否编译期常数，走不同 witness 分支。
         let reg1_is_constant = check_constants(&a.0[0], &a.0[1]);
         let reg2_is_constant = check_constants(&b.0[0], &b.0[1]);
 
@@ -608,6 +621,7 @@ impl<F: PrimeField, CS: Circuit<F>> OptimizationContext<F, CS> {
         let exec_flag_var = exec_flag.get_variable().unwrap();
 
         match (reg1_is_constant, reg2_is_constant) {
+            // ADD 行 `a`、`b` 都是 `Num::Var`（来自 slot 读值），走 `((false,false),(false,false))` 分支：
             ((false, false), (false, false)) => {
                 let a = a.0.map(|el| el.get_variable());
                 let b = b.0.map(|el| el.get_variable());
@@ -624,7 +638,7 @@ impl<F: PrimeField, CS: Circuit<F>> OptimizationContext<F, CS> {
                     } else {
                         a.overflowing_add(&b)
                     };
-
+                    // 仅当 `exec_flag=1` 时把 16 写入 `res`；`exec_flag=0` 时 `res` 保持未约束（由其他 family 或写回路径处理）
                     placer.conditionally_assign_u32(res_vars, &mask, &result);
                     placer.conditionally_assign_mask(of_flag_var, &mask, &of);
                 };
@@ -790,6 +804,15 @@ impl<F: PrimeField, CS: Circuit<F>> OptimizationContext<F, CS> {
             let (flags, a_s, b_s, c_s): (Vec<_>, Vec<_>, Vec<_>, Vec<_>) = {
                 itertools::multiunzip(self.add_sub_relations.iter().filter_map(|e| {
                     if e.0 == cur_index {
+                        // 把 index = cur_index 的所有 add/sub relation 全抓出来。
+                        // 如果 cur_index = 0，那抓出来的就是：
+                        // AddOp 的第 0 条
+                        // SubOp 的第 0 条
+                        // LoadOp 的第 0 条
+                        // StoreOp 的第 0 条
+                        // JumpOp 的第 0 条
+                        // ...
+                        // 然后后面再做按 flag 加权
                         Some((e.1.exec_flag, e.1.a, e.1.b, e.1.c))
                     } else {
                         None
@@ -830,6 +853,10 @@ impl<F: PrimeField, CS: Circuit<F>> OptimizationContext<F, CS> {
                 let carry_out = self.add_sub_ofs[cur_index];
 
                 for (i, flag) in flags.iter().enumerate() {
+                    // 谁的 exec_flag = 1，就选谁的 a,b,c
+                    // a_eff = sum_i (flag_i * a_i)    // 只有 flag=1 的那项留下
+                    // b_eff = sum_i (flag_i * b_i)
+                    // c_eff = sum_i (flag_i * c_i)
                     a_constraint_low = mask_by_boolean_into_accumulator_constraint(
                         flag,
                         &a_s[i].0[0],

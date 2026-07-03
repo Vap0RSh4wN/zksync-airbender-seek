@@ -1,5 +1,8 @@
 use super::*;
 
+/// 1. 创建一个新的 Variable(num_variables)。
+/// 2. 把这个新变量加入 all_variables_to_place。
+/// 3. num_variables += 1。返回这个新变量。
 pub fn add_compiler_defined_variable(
     num_variables: &mut u64,
     all_variables_to_place: &mut BTreeSet<Variable>,

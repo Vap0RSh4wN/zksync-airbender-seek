@@ -78,6 +78,8 @@ impl<
         opt_ctx: &mut OptimizationContext<F, CS>,
     ) -> CommonDiffs<F> {
         // reset_indexers：本 family 若多次用 opt_ctx，先重置内部索引（AddOp 只登记一条加法）。
+        // indexer 记录的是：“本 family 内部，第几条同类关系”，不是全局累计编号。
+        // 所以每个 family 开头都重置成 0
         opt_ctx.reset_indexers();
         // 只有当前行decoder确定属于ADD/ADDI family时，这些关系才会生效。
         // decoder 在 4.9 已判定本行是否为 ADD/ADDI；ADD 行 is_add=1。

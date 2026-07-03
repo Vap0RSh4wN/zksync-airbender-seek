@@ -61,6 +61,7 @@ pub fn calculate_pc_next_no_overflows<F: PrimeField, CS: Circuit<F>>(
     // - compute new high as pc_high + ((pc_low + 4 - result) >> 16)
     // - make sure that new high is not equal to 2^16
 
+    // **Step 1 — 分配 pc_next_low 并 range check
     let pc_next_low = circuit.add_variable();
     circuit.require_invariant(
         pc_next_low,
@@ -70,6 +71,9 @@ pub fn calculate_pc_next_no_overflows<F: PrimeField, CS: Circuit<F>>(
     );
 
     let pc_t = pc.get_terms();
+    // **Step 2 — 构造 carry 约束**
+    // carry_constraint = (pc_low + 4 - pc_next_low) / 2^16
+    // 实现上先拼 `pc_t[0] + PC_INC_STEP - pc_next_low`，再 `scale(1/2^16)`。然后 `carry_constraint * (carry_constraint - 1) = 0` 强制 carry ∈ {0,1}。
     let mut carry_constraint = Constraint::empty();
     carry_constraint += pc_t[0].clone();
     carry_constraint += Term::from(PC_INC_STEP);
@@ -81,6 +85,7 @@ pub fn calculate_pc_next_no_overflows<F: PrimeField, CS: Circuit<F>>(
     t -= Term::from(1u64);
     circuit.add_constraint(carry_constraint.clone() * t);
 
+    // **Step 3 — 算 pc_next_high**
     let mut pc_high_constraint = carry_constraint;
     pc_high_constraint += pc_t[1].clone();
     // we will evaluate witness below all at once
@@ -89,6 +94,9 @@ pub fn calculate_pc_next_no_overflows<F: PrimeField, CS: Circuit<F>>(
             pc_high_constraint,
         );
     // ensure that it is not equal to 2^16
+
+    // **Step 4 — 禁止 32-bit 溢出**
+    // 若 `pc_next_high = 2^16`（非法），无法分配 `inversion_witness`，电路不可满足。
     let inversion_witness = circuit.add_variable();
     circuit.add_constraint(
         (Term::from(inversion_witness) * (Term::from(pc_next_high) - Term::from(1u64 << 16)))
@@ -109,7 +117,9 @@ pub fn calculate_pc_next_no_overflows<F: PrimeField, CS: Circuit<F>>(
         let pc_inc_step =
             <CS::WitnessPlacer as WitnessTypeSet<F>>::U32::constant(PC_INC_STEP as u32);
         let pc = placer.get_u32_from_u16_parts(pc_vars);
-        let (pc_next, _of) = pc.overflowing_add(&pc_inc_step);
+        // **Step 5 — witness**
+        // ADD 行：pc=0 → `next_pc_low=4`, `next_pc_high=0`。
+        let (pc_next, _of) = pc.overflowing_add(&pc_inc_step); // 0 + 4 = 4
         placer.assign_u32_from_u16_parts(pc_next_vars, &pc_next);
 
         let pc_high = pc_next.shr(16);

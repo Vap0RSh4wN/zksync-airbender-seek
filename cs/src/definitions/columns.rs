@@ -151,9 +151,13 @@ impl<const WIDTH: usize> AlignedColumnSet<WIDTH> {
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 pub enum ColumnAddress {
+    /// witness trace 列。
     WitnessSubtree(usize),
+    /// memory argument 相关列
     MemorySubtree(usize),
+    /// setup trace 固定列
     SetupSubtree(usize),
+    /// 优化输出位置
     OptimizedOut(usize),
 }
 

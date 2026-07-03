@@ -144,7 +144,8 @@ pub fn pad_bytecode<const ROM_ADDRESS_SPACE_BOUND: u32>(bytecode: &mut Vec<u32>)
 // We have to do this his way, as our prime field is a little bit smaller than 32 bits.
 // All the entries larger than the image will be filled with UNIMP_OPCODE.
 
-/// 返回LookupTable<F, 3>，表示每行有3个field元素。源码注释明确写了ROM表的样子：第一列是地址，后两列是对应4字节instruction的低16位和高16位；注释里还说明这样拆是因为prime field略小于32 bits。
+/// 返回LookupTable<F, 3>，表示每行有3个field元素。源码注释明确写了ROM表的样子：第一列是地址，后两列是对应4字节instruction的低16位和高16位；
+/// 注释里还说明这样拆是因为prime field略小于32 bits。
 /// ROM_BITS:
 /// ROM地址空间大小参数。
 /// ROM总字节数 = 2^(16 + ROM_BITS)。
@@ -313,7 +314,8 @@ pub fn create_table_driver<
     table_driver.materialize_table(TableType::U16GetSignAndHighByte);
     table_driver.materialize_table(TableType::RangeCheckSmall);
 
-    // decoder表是后面instruction decode的重要固定表。它帮助把instruction编码分解成opcode flags。源码里OpTypeBitmask表就是在这里加入的。
+    // decoder表是后面instruction decode的重要固定表。它帮助把instruction编码分解成opcode flags。
+    // 源码里OpTypeBitmask表就是在这里加入的。
     // 把instruction的某些bit分解成opcode family和具体variant flags。
     let decoder_table = M::create_decoder_table(TableType::OpTypeBitmask.to_table_id());
     table_driver.add_table_with_content(
@@ -421,6 +423,10 @@ pub fn create_table_driver_into_cs<
     // 而compile_machine没有bytecode参数，所以不可能在这里加入RomRead。
     // 源码确实只在这里加入ROM地址空间辅助表；真正RomRead表在default_compile_machine里追加。
     // 这一行执行完之后，cs内部已经有机器通用表了，但还没有当前程序ROM内容。
+    // RomAddressSpaceSeparator:
+    //   处理地址高位，判断 ROM/RAM 范围，并输出 ROM 地址拼接所需部分。
+    // RomRead:
+    //   处理完整 ROM 地址，输出 opcode_low16 / opcode_high16。
     if M::USE_ROM_FOR_BYTECODE {
         // manual call here, to later on easily control address bits
         let id = TableType::RomAddressSpaceSeparator.to_table_id();

@@ -216,14 +216,14 @@ impl<const N: usize, A: GoodAllocator, T: MerkleTreeConstructor> SetupPrecomputa
         let subtree_cap_size = (1 << optimal_folding.total_caps_size_log2) / lde_factor;
         assert!(subtree_cap_size > 0);
 
-        // 第一步，生成主domain上的setup trace
+        // 第一步，生成主domain上的setup trace，里面写的是固定表、range table、timestamp table，不是 CPU 执行值。
         let mut main_domain_trace =
             Self::get_main_domain_trace(table_driver, trace_len, setup_layout, worker);
 
         // 第二步，调整最后一行。不使用setup的最后一行，并且必须调整到c0 == 0。这和前面trace_len - 1作为表编码容量相呼应。
         adjust_to_zero_c0_var_length(&mut main_domain_trace, 0..setup_layout.total_width, worker);
 
-        // 第三步，做LDE
+        // 第三步，对 setup trace做LDE
         let ldes = compute_wide_ldes(
             main_domain_trace,
             twiddles,
@@ -238,6 +238,7 @@ impl<const N: usize, A: GoodAllocator, T: MerkleTreeConstructor> SetupPrecomputa
         // 第四步，为每个LDE coset构造Merkle tree
         let mut trees = Vec::with_capacity(lde_factor);
         for domain in ldes.iter() {
+            // 对每个 LDE coset 构造 Merkle tree。
             let tree = T::construct_for_coset(&domain.trace, subtree_cap_size, true, worker);
             trees.push(tree);
         }
@@ -274,22 +275,28 @@ impl<const N: usize, A: GoodAllocator, T: MerkleTreeConstructor> SetupPrecomputa
 
         // 准备几类固定表内容
 
-        // 这一步把所有generic lookup tables表拼成统一格式的表行。每一行是宽度4：[table_col_0, table_col_1, table_col_2, table_id]
+        // 这一步把所有generic lookup tables表拼成统一格式的表行。把 RomRead、OpTypeBitmask、CSR、bit表等 generic lookup 表拼成一组固定行。
+        // 每一行是宽度4：[table_col_0, table_col_1, table_col_2, table_id]
         let all_generic_tables = table_driver.dump_tables();
         // assert拼接行数等于table_driver.total_tables_len
         assert_eq!(all_generic_tables.len(), table_driver.total_tables_len);
 
-        // 创建两个固定range表，16-bit range table，按整数范围生成field元素
+        // 创建两个固定range表，16-bit range table，按整数范围生成field元素，值是 0..2^16-1
         let range_check_16_table: Vec<_> = (0..(1 << 16))
             .map(|el| Mersenne31Field(el as u32))
             .collect();
-        // timestamp range table
+        // 值是 timestamp low limb 可取范围
         let timestamp_range_check_table: Vec<_> = (0..(1 << TIMESTAMP_COLUMNS_NUM_BITS))
             .map(|el| Mersenne31Field(el as u32))
             .collect();
 
         // 把generic tables按trace_len - 1切块，每个chunk写到一组generic_lookup_setup_columns里。
         // 源码里也检查chunk数量和setup layout里的元素数量一致。
+        // 把 all_generic_tables 按 trace_len - 1 切成 chunks
+        // `all_generic_tables`里的每一行是 setup fixed lookup row。对于 `RomRead`，概念上是：
+        // [pc, opcode_low16, opcode_high16, RomRead_table_id]
+        // 具体是否附加 table id 取决于 table dump 的 common width encoding。第四章之前已经问过：`LookupTable::dump_into`会把 `id`写到行尾。
+        // 第五章只关注 `SetupPrecomputations`拿到的是已经统一编码后的 table rows。
         let generic_tables_chunks: Vec<_> = all_generic_tables
             .chunks(table_encoding_capacity_per_tuple)
             .collect();
@@ -306,7 +313,13 @@ impl<const N: usize, A: GoodAllocator, T: MerkleTreeConstructor> SetupPrecomputa
 
         let all_generic_tables_ref = &generic_tables_chunks;
 
+        // 1. 遍历 setup trace 的前 trace_len - 1 行。
+        // 2. 如果当前行在 range_check_16_table 范围内，写 range_check_16_setup_column。
+        // 3. 如果当前行在 timestamp_range_check_table 范围内，写 timestamp_range_check_setup_column。
+        // 4. 遍历 generic table chunks。
+        // 5. 如果当前行在当前 chunk 内，把 table_row 写进 generic_lookup_setup_columns 对应列范围。
         // 按行填setup trace，进入worker并行写每一行。对每个absolute_row_idx：
+        // 最后一行不在 worker.scope(trace_len - 1) 范围内，后续由 adjust_to_zero_c0_var_length 处理。
         worker.scope(trace_len - 1, |scope, geometry| {
             for thread_idx in 0..geometry.len() {
                 let chunk_size = geometry.get_chunk_size(thread_idx);

@@ -71,6 +71,7 @@ pub(crate) fn optimized_base_isa_state_transition<
 
     // now with PC considered range-checked we can compute next PC without overflows
     // 默认next_pc = pc + 4。branch、jump等opcode family后面可以返回自定义pc候选值。
+    // 跨行状态在 optimized 配置里主要是 pc（寄存器状态在 shuffle RAM trace 里）。每行结束必须给出「下一行从哪条指令继续」。顺序执行时 next_pc = pc + 4；跳转/分支由对应 family 提供 Custom pc。
     let next_pc = calculate_pc_next_no_overflows(cs, pc);
 
     // OptimizationContext先收集候选算术关系、lookup关系和is_zero关系，稍后统一落成Constraint。
@@ -317,6 +318,8 @@ pub(crate) fn optimized_base_isa_state_transition<
 
     assert!(OUTPUT_EXACT_EXCEPTIONS == false);
 
+    // 把下一行取指地址写回 state linkage。ADD 行 `new_pc=4`，下一行从 `pc=4` 继续执行。
+    // 寄存器 `x5` 从 100 变成 16，不是通过 `final_state.regs[5]` 传递，而是通过 4.16 登记的 slot2 写操作交给 memory argument 证明。
     let final_state = writeback_no_exception_with_opcodes_in_rom::<
         F,
         CS,

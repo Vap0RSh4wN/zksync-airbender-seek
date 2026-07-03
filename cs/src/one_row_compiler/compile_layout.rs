@@ -24,7 +24,8 @@ impl<F: PrimeField> OneRowCompiler<F> {
         circuit_output: CircuitOutput<F>,
         trace_len_log2: usize,
     ) -> CompiledCircuitArtifact<F> {
-        // 其中false表示这不是delegation circuit，而是main chunked memory argument路径。源码里两个入口分别是compile_output_for_chunked_memory_argument和compile_to_evaluate_delegations。
+        // 其中false表示这不是delegation circuit，而是main chunked memory argument路径。
+        // 源码里两个入口分别是compile_output_for_chunked_memory_argument和compile_to_evaluate_delegations。
         Self::compile_inner::<false>(self, circuit_output, trace_len_log2)
     }
 
@@ -36,6 +37,19 @@ impl<F: PrimeField> OneRowCompiler<F> {
         Self::compile_inner::<true>(self, circuit_output, trace_len_log2)
     }
 
+    /// 从CircuitOutput
+    /// -> 检查 main RISC-V / delegation 形状
+    /// -> 计算 setup_layout
+    /// -> 布局 memory subtree
+    /// -> 布局 witness subtree
+    /// -> 编译 range check
+    /// -> 编译 boolean constraints
+    /// -> 编译 lookup queries
+    /// -> 编译 timestamp range check expressions
+    /// -> 优化掉部分变量
+    /// -> 编译普通 constraints
+    /// -> 生成 public inputs / state linkage
+    /// -> 生成 CompiledCircuitArtifact
     fn compile_inner<const FOR_DELEGATION: bool>(
         &self,
         circuit_output: CircuitOutput<F>,
@@ -44,7 +58,8 @@ impl<F: PrimeField> OneRowCompiler<F> {
         // our main purposes are:
         // 第一，CircuitOutput里只有Variable(0)、Variable(1)这种编号；真正prover需要的是“第几列”。compiler会决定每个变量落到哪个区域、哪个列offset。
         // 第二，Airbender的trace不是单一平面。变量可能属于普通witness列，也可能属于memory argument相关列，还可能属于setup列。compiler要把它们分区域。
-        // 第三，约束原来写成Variable表达式；compiler要把它改写成ColumnAddress表达式。后面prover/verifier评价约束时，不会再按Variable找值，而是直接从witness row、memory row、setup row里按列地址读值。
+        // 第三，约束原来写成Variable表达式；compiler要把它改写成ColumnAddress表达式。
+        // 后面prover/verifier评价约束时，不会再按Variable找值，而是直接从witness row、memory row、setup row里按列地址读值。
         // 第四，compiler还会做一些布局优化和变量放置策略。这个以后读性能细节时再展开。
 
         // 拆开
@@ -68,7 +83,7 @@ impl<F: PrimeField> OneRowCompiler<F> {
 
         assert!(trace_len_log2 > TIMESTAMP_COLUMNS_NUM_BITS as usize);
 
-        // 先做分支检查：
+        // 先做分支检查：FOR_DELEGATION=true是delegation
         if FOR_DELEGATION {
             assert!(state_input.is_empty());
             assert!(state_output.is_empty());
@@ -109,10 +124,14 @@ impl<F: PrimeField> OneRowCompiler<F> {
             assert!(register_and_indirect_memory_accesses.is_empty());
         }
 
+        // 当前 circuit trace 总行数
         let trace_len = 1usize << trace_len_log2;
+        // 所有 fixed lookup table dump 后的总行数
         let total_tables_size = table_driver.total_tables_len;
-        // 为什么table encoding capacity是trace_len - 1？因为setup trace最后一行不用于普通表内容。源码里compile_inner用它计算generic lookup setup需要多少列组。
+        // 为什么table encoding capacity是trace_len - 1？因为setup trace最后一行不用于普通表内容。
+        // 源码里compile_inner用它计算generic lookup setup需要多少列组。
         let lookup_table_encoding_capacity = trace_len - 1;
+        // 需要多少组 setup lookup columns 才能放完所有 fixed table rows。
         let mut num_required_tuples_for_generic_lookup_setup =
             total_tables_size / lookup_table_encoding_capacity;
         if total_tables_size % lookup_table_encoding_capacity != 0 {
@@ -135,15 +154,20 @@ impl<F: PrimeField> OneRowCompiler<F> {
         let mut boolean_vars = boolean_vars;
         let mut range_check_expressions = range_check_expressions;
 
+        // 当前变量总数。后面 compiler 还会创建一些辅助变量，所以它会继续增长。
         let mut num_variables = num_of_variables as u64;
 
+        // 所有还没分配列位置的 Variable
         let mut all_variables_to_place = BTreeSet::new();
         for variable_idx in 0..num_variables {
             all_variables_to_place.insert(Variable(variable_idx));
         }
-
+        // 当前 memory subtree 已经用了多少列。
         let mut memory_tree_offset = 0;
         // as a byproduct we will also create a map of witness generation functions
+        // `layout`最后会进入 `CompiledCircuitArtifact.variable_mapping`。
+        // 第四章已经解释：`Variable(17)`不是第17列，compiler 阶段才会变成 `ColumnAddress`。本章只记录这个转换发生在 `OneRowCompiler`。
+        // Variable -> ColumnAddress 的映射表
         let mut layout = BTreeMap::<Variable, ColumnAddress>::new();
 
         const SHIFT_16: u64 = 1 << 16;
@@ -611,13 +635,25 @@ impl<F: PrimeField> OneRowCompiler<F> {
             // NOTE: lookup expressions do not allow to express a relation between two rows,
             // so we will pay to materialize intermediate subtraction result variables
 
+            // 把四个辅助变量打包成一个对象：
+            // (
+            //     [地址差值 low/high 辅助变量],
+            //     中间借位变量,
+            //     最终借位变量
+            // )
             let lazy_init_aux_set = {
+                // `tmp_low_var` 和 `tmp_high_var` 是地址差值拆分后的两个 16-bit limb
+                // 为了把 32-bit 地址比较拆成 field 友好的形式，需要 low/high 两段辅助值
                 let tmp_low_var =
                     add_compiler_defined_variable(&mut num_variables, &mut all_variables_to_place);
                 let tmp_high_var =
                     add_compiler_defined_variable(&mut num_variables, &mut all_variables_to_place);
+
+                // 地址比较会产生借位
+                // intermediate_borrow_var:low 16-bit 减法产生的中间借位。
                 let intermediate_borrow_var =
                     add_compiler_defined_variable(&mut num_variables, &mut all_variables_to_place);
+                // final_borrow_var:high 16-bit 减法后的最终借位。
                 let final_borrow_var =
                     add_compiler_defined_variable(&mut num_variables, &mut all_variables_to_place);
 
@@ -626,6 +662,10 @@ impl<F: PrimeField> OneRowCompiler<F> {
                     intermediate_borrow_var,
                     final_borrow_var,
                 );
+                // 这两个值必须是 16-bit，所以后面加入 range check
+                // `LARGE_RANGE_CHECK_TABLE_WIDTH` 在这里对应 16-bit range check
+                // 这里还没有执行 range check。这里只是把 range check 请求加入 `range_check_expressions`。
+                // 后面 witness subtree 布局阶段会读取这些请求，并生成对应 lookup expression。
                 range_check_expressions.push(RangeCheckQuery::new(
                     tmp_low_var,
                     LARGE_RANGE_CHECK_TABLE_WIDTH,
@@ -634,21 +674,25 @@ impl<F: PrimeField> OneRowCompiler<F> {
                     tmp_high_var,
                     LARGE_RANGE_CHECK_TABLE_WIDTH,
                 ));
+                // 这两个变量只能是 0 或 1，所以加入 `boolean_vars`，后面 witness subtree 布局 boolean 变量时，会给每个 boolean 变量加约束
                 boolean_vars.push(intermediate_borrow_var);
                 boolean_vars.push(final_borrow_var);
 
                 lazy_init_aux_set
             };
-
+            // `REGISTER_SIZE` 表示一个 32-bit RISC-V word 在 field trace 里拆成多少个 limb，REGISTER_SIZE = 2
+            // 创建两个变量，表示当前 row 的 lazy init address，是 32-bit 地址，所以拆成两个 16-bit limb
             let shuffle_ram_init_addresses = add_multiple_compiler_defined_variables::<REGISTER_SIZE>(
                 &mut num_variables,
                 &mut all_variables_to_place,
             );
+            // 表示当前 row 的 teardown value, 也就是某个 memory cell 在 chunk 结束时的最终值
             let shuffle_ram_teardown_values = add_multiple_compiler_defined_variables::<
                 REGISTER_SIZE,
             >(
                 &mut num_variables, &mut all_variables_to_place
             );
+            // 当前 row 的 teardown timestamp。timestamp 也会拆成多个 limb。`NUM_TIMESTAMP_COLUMNS_FOR_RAM` 表示 timestamp 在 memory subtree 中占多少列。
             let shuffle_ram_teardown_timestamps = add_multiple_compiler_defined_variables::<
                 NUM_TIMESTAMP_COLUMNS_FOR_RAM,
             >(
@@ -660,18 +704,30 @@ impl<F: PrimeField> OneRowCompiler<F> {
 
             // NOTE: we will separately add to the quotient and range check 16 layouts in stage 2 parts the fact that
             // lazy init addresses are under range check 16
+
+            // 这些列只是在 setup/compile 阶段分配位置。真实值在 witness 阶段才写入。
+            // `layout_memory_subtree_multiple_variables` 把一组 Variable 连续放进 memory subtree。
+            // 1. 从 memory_tree_offset 当前值开始分配列。
+            // 2. 对每个 Variable 插入：Variable -> ColumnAddress::MemorySubtree(offset)
+            // 3. 从 all_variables_to_place 删除这些变量。
+            // 4. 推进 memory_tree_offset。
+            // 5. 返回 ColumnSet，记录这一组变量对应的列范围。
+
+            // 每一行 lazy init 的 address
             let lazy_init_addresses_columns = layout_memory_subtree_multiple_variables(
                 &mut memory_tree_offset,
                 shuffle_ram_init_addresses,
                 &mut all_variables_to_place,
                 &mut layout,
             );
+            // 每一行 teardown 的 value
             let lazy_teardown_values_columns = layout_memory_subtree_multiple_variables(
                 &mut memory_tree_offset,
                 shuffle_ram_teardown_values,
                 &mut all_variables_to_place,
                 &mut layout,
             );
+            // 每一行 teardown 的 timestamp
             let lazy_teardown_timestamps_columns = layout_memory_subtree_multiple_variables(
                 &mut memory_tree_offset,
                 shuffle_ram_teardown_timestamps,
@@ -679,8 +735,10 @@ impl<F: PrimeField> OneRowCompiler<F> {
                 &mut layout,
             );
 
+            // 这 3 个 query 必须按 local timestamp 从小到大排列。
             assert!(shuffle_ram_queries
                 .is_sorted_by(|a, b| a.local_timestamp_in_cycle < b.local_timestamp_in_cycle));
+            // 相邻 query 的 local timestamp 必须正好差 1。
             shuffle_ram_queries.windows(2).for_each(|el| {
                 assert!(el[0].local_timestamp_in_cycle + 1 == el[1].local_timestamp_in_cycle)
             });
@@ -696,8 +754,14 @@ impl<F: PrimeField> OneRowCompiler<F> {
             let mut memory_timestamp_comparison_sets = vec![];
 
             for (query_idx, memory_query) in shuffle_ram_queries.iter().enumerate() {
+                // `memory_query.local_timestamp_in_cycle` 是 query 自己记录的 cycle 内访问顺序，要求：
+                // 第 0 个 query 的 local timestamp 是 0。
+                // 第 1 个 query 的 local timestamp 是 1。
+                // 第 2 个 query 的 local timestamp 是 2。
                 assert_eq!(query_idx, memory_query.local_timestamp_in_cycle);
 
+                // 每个 memory/register 访问都要记录：这次读操作读到的是该地址在哪个历史 timestamp 写入的值。
+                // 这就是 `read_timestamp`。
                 let [read_timestamp_low, read_timestamp_high] =
                     add_multiple_compiler_defined_variables::<NUM_TIMESTAMP_COLUMNS_FOR_RAM>(
                         &mut num_variables,
@@ -711,6 +775,15 @@ impl<F: PrimeField> OneRowCompiler<F> {
                 );
 
                 // now that we have declared timestamps, we can produce comparison expressions for range checks
+                // 每个访问都需要证明：
+                // read_timestamp < write_timestamp
+                // 因为一次读操作必须读取过去写入的值，不能读取未来写入的值。
+                // 为了证明两个 timestamp 的大小关系，需要一个借位辅助变量：
+                // borrow_var
+                // 这个变量只能是 0 或 1，所以加入 `boolean_vars`：
+                // boolean_vars.push(borrow_var);
+                // 后面布局 boolean vars 时，它会进入 witness subtree，并生成：
+                // borrow_var^2 - borrow_var = 0
                 let borrow_var =
                     add_compiler_defined_variable(&mut num_variables, &mut all_variables_to_place);
                 boolean_vars.push(borrow_var);
@@ -725,6 +798,7 @@ impl<F: PrimeField> OneRowCompiler<F> {
                 let set = borrow_var;
                 memory_timestamp_comparison_sets.push(set);
 
+                // `memory_query.read_value` 是当前访问读到的值
                 let read_value = layout_memory_subtree_multiple_variables(
                     &mut memory_tree_offset,
                     memory_query.read_value,
@@ -733,6 +807,7 @@ impl<F: PrimeField> OneRowCompiler<F> {
                 );
 
                 let address = match memory_query.query_type {
+                    // 这种访问只能是寄存器访问。main RISC-V 中 slot0 是这种情况
                     ShuffleRamQueryType::RegisterOnly { register_index } => {
                         let register_index = layout_memory_subtree_variable(
                             &mut memory_tree_offset,
@@ -745,6 +820,7 @@ impl<F: PrimeField> OneRowCompiler<F> {
                             register_index,
                         })
                     }
+                    // 这种访问可能是寄存器，也可能是 RAM。main RISC-V 中 slot1 和 slot2 都可能是这种情况
                     ShuffleRamQueryType::RegisterOrRam {
                         is_register,
                         address,
@@ -762,6 +838,13 @@ impl<F: PrimeField> OneRowCompiler<F> {
                             &mut layout,
                         );
 
+                        // is_register:
+                        //   1 表示这个访问是 register。
+                        //   0 表示这个访问是 RAM。
+
+                        // address:
+                        //   如果 is_register = 1，则 address 表示 register index。
+                        //   如果 is_register = 0，则 address 表示 RAM address。
                         ShuffleRamAddress::RegisterOrRam(RegisterOrRamAccessAddress {
                             is_register,
                             address,
@@ -769,6 +852,8 @@ impl<F: PrimeField> OneRowCompiler<F> {
                     }
                 };
 
+                // 判断当前 query 是 readonly 还是 write
+                // 对于 readonly 访问，read_value 和 write_value 是同一个变量。
                 let query_columns = if memory_query.is_readonly() {
                     assert_eq!(memory_query.read_value, memory_query.write_value);
 
@@ -782,6 +867,7 @@ impl<F: PrimeField> OneRowCompiler<F> {
 
                     ShuffleRamQueryColumns::Readonly(query_columns)
                 } else {
+                    // 如果不是 readonly，就是 write query, 需要额外布局 write_value
                     let write_value = layout_memory_subtree_multiple_variables(
                         &mut memory_tree_offset,
                         memory_query.write_value,
@@ -800,7 +886,12 @@ impl<F: PrimeField> OneRowCompiler<F> {
 
                     ShuffleRamQueryColumns::Write(query_columns)
                 };
-
+                // `shuffle_ram_access_sets` 最后会放进 `MemorySubtree`。
+                // 它保存 main RISC-V 3 个 slot 的列布局：
+                // shuffle_ram_access_sets[0] -> slot0 的 address / read_timestamp / read_value 列位置
+                // shuffle_ram_access_sets[1] -> slot1 的 address / read_timestamp / read_value / maybe write_value 列位置
+                // shuffle_ram_access_sets[2] -> slot2 的 address / read_timestamp / read_value / write_value 列位置
+                // 第六章 witness 阶段的 `process_shuffle_ram_accesses` 会根据这个布局，把真实 cycle 数据写入 `memory_row`。
                 shuffle_ram_access_sets.push(query_columns);
             }
 
@@ -879,6 +970,8 @@ impl<F: PrimeField> OneRowCompiler<F> {
                 None
             };
 
+            // 说明 lazy init / teardown 是 MemorySubtree 的一部分
+            // 记录 lazy init / teardown 的 memory columns
             let shuffle_ram_inits_and_teardowns = ShuffleRamInitAndTeardownLayout {
                 lazy_init_addresses_columns,
                 lazy_teardown_values_columns,
@@ -907,6 +1000,8 @@ impl<F: PrimeField> OneRowCompiler<F> {
             )
         };
 
+        // memory subtree 布局完成后，代码开始布局 witness subtree。
+
         // now we need to satisfy placement that have constraints on their layout. Luckily there is only one such kind here
         // - we need to put lookup variables into corresponding columns, as well as memory ones
 
@@ -916,12 +1011,24 @@ impl<F: PrimeField> OneRowCompiler<F> {
 
         // then lookup ones
 
+        // `witness_tree_offset` 是 witness subtree 的列分配游标。
+        // 它和 `memory_tree_offset` 类似，但管理的是 witness subtree
+
+        // 表示 witness subtree 当前还没有分配任何列
         let mut witness_tree_offset = 0;
+
+        // lookup argument 需要证明 witness 实际发出的 lookup 查询多重集合 == setup 固定表行按照 multiplicity 展开后的多重集合。
+
+        // 这一列记录 16-bit range check 表的 multiplicity
         let multiplicities_columns_for_range_check_16 =
             ColumnSet::layout_at(&mut witness_tree_offset, 1);
+        // 这一列记录 timestamp range check 表的 multiplicity。
+        // timestamp 比较会产生 range check 查询，所以也要记录 multiplicity。
         let multiplicities_columns_for_timestamp_range_check =
             ColumnSet::layout_at(&mut witness_tree_offset, 1);
 
+        // num_required_tuples_for_generic_lookup_setup 是前面根据total_tables_size / (trace_len - 1)算出来的组数。
+        // setup trace 里 generic lookup table rows 分几组放，witness multiplicity columns 也要有对应的组数。
         let multiplicities_columns_for_generic_lookup = ColumnSet::layout_at(
             &mut witness_tree_offset,
             num_required_tuples_for_generic_lookup_setup,
@@ -932,13 +1039,21 @@ impl<F: PrimeField> OneRowCompiler<F> {
             let LookupInput::Variable(..) = input else {
                 unimplemented!()
             };
+            // 只允许两类宽度：
+            // SMALL_RANGE_CHECK_TABLE_WIDTH:
+            //   小 range check，通常对应 8-bit。
+            // LARGE_RANGE_CHECK_TABLE_WIDTH:
+            //   大 range check，通常对应 16-bit。
             assert!(
                 *width == LARGE_RANGE_CHECK_TABLE_WIDTH || *width == SMALL_RANGE_CHECK_TABLE_WIDTH
             );
         }
 
         // We will place 8-bit range check variables, and then 16-bit ones
-
+        // 这里把 range check query 分成两组：
+        // 8-bit range check variables
+        // 16-bit range check variables
+        // 然后分别布局。
         let range_check_8_iter = range_check_expressions
             .iter()
             .filter(|el| el.width == SMALL_RANGE_CHECK_TABLE_WIDTH);
@@ -948,12 +1063,29 @@ impl<F: PrimeField> OneRowCompiler<F> {
 
         let num_range_check_8 = range_check_8_iter.clone().count();
         let num_range_check_16 = range_check_16_iter.clone().count();
-
+        // 1. 给所有 8-bit range check variables 分配一段 witness columns。
+        // 2. 遍历每个 8-bit range check query。
+        // 3. 取出其中的 Variable。
+        // 4. 把这个 Variable 放到指定 witness column。
+        // 5. 更新 layout。
+        // 6. 从 all_variables_to_place 删除该 Variable。
+        // 例如：
+        // Variable(50) 需要 8-bit range check。
+        // 如果分配到 witness subtree 第 10 列：
+        // Variable(50) -> WitnessSubtree(10)
+        // 之后 layout 里会记录：
+        // layout[Variable(50)] = ColumnAddress::WitnessSubtree(10)
         let range_check_8_columns: ColumnSet<1> =
             ColumnSet::layout_at(&mut witness_tree_offset, num_range_check_8);
         let range_check_8_columns_it = range_check_8_columns.iter();
 
         for (input, mut layout_part) in range_check_8_iter.zip(range_check_8_columns_it) {
+            // 表示这里暂时只处理：
+            // RangeCheckQuery {
+            // input: LookupInput::Variable(variable),
+            // width: ...
+            // }
+            // 暂时不处理复杂表达式形式的 range check。
             let LookupInput::Variable(input) = input.input else {
                 unimplemented!()
             };
@@ -992,6 +1124,14 @@ impl<F: PrimeField> OneRowCompiler<F> {
                 &mut all_variables_to_place,
                 &mut layout,
             );
+            // 告诉后面的 lookup argument：
+            // 这个 witness column 里的值，需要去 16-bit range table 里查。
+            // 例如：
+            // pc_low -> WitnessSubtree(20)
+            // 会生成：
+            // LookupExpression::Variable(WitnessSubtree(20))
+            // 后面 witness 阶段会统计：
+            // pc_low 实际值查询了 16-bit range table 的哪一行。
             let lookup_expr = LookupExpression::Variable(place);
             range_check_16_lookup_expressions.push(lookup_expr)
         }
@@ -1011,28 +1151,41 @@ impl<F: PrimeField> OneRowCompiler<F> {
         let mut compiled_quadratic_terms = vec![];
         let mut compiled_linear_terms = vec![];
 
+        // 1. Machine 代码中显式要求某些变量是 boolean。
+        // 2. compiler 自己创建的 borrow 变量。
+        // 3. opcode flag、is_register flag、carry flag 等。
         let mut boolean_vars_start = witness_tree_offset;
         let num_boolean_vars = boolean_vars.len();
         let boolean_vars_columns_range =
             ColumnSet::layout_at(&mut boolean_vars_start, num_boolean_vars);
 
         // first we can layout booleans
+        // 1. 给每个 boolean variable 分配 witness column。
+        // 2. 给每个 boolean variable 生成 boolean constraint。
         for variable in boolean_vars.into_iter() {
+            // 1. 从 all_variables_to_place 删除该变量。如果删除失败，说明变量已经被放置过，直接报错。
             assert!(
                 all_variables_to_place.remove(&variable),
                 "variable {:?} was already placed",
                 variable
             );
+            // 2. 创建列地址：ColumnAddress::WitnessSubtree(witness_tree_offset)
             let place = ColumnAddress::WitnessSubtree(witness_tree_offset);
+            // 3. 写入 layout：variable -> WitnessSubtree(witness_tree_offset)
             layout.insert(variable, place);
             witness_tree_offset += 1;
 
+            // 生成 b^2 - b = 0：1 * place * place - 1 * place = 0
             let mut quadratic_terms = vec![];
             let mut linear_terms = vec![];
             quadratic_terms.push((F::ONE, place, place));
             linear_terms.push((F::MINUS_ONE, place));
 
             // we also need to make constraints for them
+            // 这里生成的是已经使用 `ColumnAddress` 的约束，不再是 `Variable` 约束。
+            // 例如：Variable(80) -> WitnessSubtree(30)
+            // boolean 约束变成：WitnessSubtree(30)^2 - WitnessSubtree(30) = 0
+            // 这个约束会进入最终：CompiledCircuitArtifact.degree_2_constraints
             let compiled_term = CompiledDegree2Constraint {
                 quadratic_terms: quadratic_terms.into_boxed_slice(),
                 linear_terms: linear_terms.into_boxed_slice(),
@@ -1057,15 +1210,25 @@ impl<F: PrimeField> OneRowCompiler<F> {
         for lookup_query in lookups {
             let LookupQuery { row, table } = lookup_query;
             assert_eq!(row.len(), 3);
+            // 说明这里处理的是 width-3 lookup。
+            // 这里的 `row.len() == 3` 表示 lookup query 有 3 个主要 field 元素。
+            // 再加上 table id 后，dump 到 setup table 时可能会有统一编码格式。
+            // `width_3_lookups` 保存编译后的 lookup 描述，最后进入：WitnessSubtree.width_3_lookups
 
             let mut input_columns = Vec::with_capacity(3);
             for el in row.into_iter() {
                 match el {
+                    // 1. 如果这个 Variable 已经在 layout 里：
+                    // 直接拿它的 ColumnAddress。
                     LookupInput::Variable(single_var) => {
                         let place = if let Some(place) = layout.get(&single_var) {
                             // it's already placed
                             *place
                         } else {
+                            //    2. 如果这个 Variable 还没有被放置：
+                            //    把它放进 witness subtree。
+                            //    更新 layout。
+                            //    推进 witness_tree_offset。
                             let column = layout_witness_subtree_variable(
                                 &mut witness_tree_offset,
                                 single_var,
@@ -1076,10 +1239,51 @@ impl<F: PrimeField> OneRowCompiler<F> {
 
                             place
                         };
-
+                        // 3. 把 ColumnAddress 包装成 LookupExpression::Variable。
                         let lookup_expr = LookupExpression::Variable(place);
+                        // 4. 加入 input_columns。
                         input_columns.push(lookup_expr);
                     }
+                    // `LookupInput::Expression` 表示 lookup 输入不是单个变量，而是一个线性表达式。
+                    //例如：
+                    // ```text
+                    // rom_address = pc_low + 2^16 * rom_address_low
+                    // ```
+
+                    // 在 `CircuitOutput` 里可能表示为：
+
+                    // ```text
+                    // LookupInput::Expression {
+                    //   linear_terms: [
+                    //     (1, pc_low),
+                    //     (2^16, rom_address_low)
+                    //   ],
+                    //   constant_coeff: 0
+                    // }
+                    // ```
+
+                    // `compile_inner` 会把每个变量替换成列地址：
+
+                    // ```text
+                    // pc_low -> WitnessSubtree(10)
+                    // rom_address_low -> WitnessSubtree(11)
+                    // ```
+
+                    // 然后得到：
+
+                    // ```text
+                    // LookupExpression::Expression(
+                    //   1 * WitnessSubtree(10)
+                    //   + 2^16 * WitnessSubtree(11)
+                    // )
+                    // ```
+
+                    // 注意：
+
+                    // ```text
+                    // 这里不会计算 rom_address 的真实值。
+                    // 这里只有列地址和线性表达式描述。
+                    // ```
                     LookupInput::Expression {
                         linear_terms,
                         constant_coeff,
@@ -1620,6 +1824,7 @@ impl<F: PrimeField> OneRowCompiler<F> {
         // - memory argument lazy init address at first and one row before last
 
         // we should add our only single linking constraint to link state -> state
+        // 因为每个输入状态变量都要对应一个输出状态变量
         assert_eq!(state_input.len(), state_output.len());
         let mut linking_constraints = vec![];
         let mut public_inputs_first_row = vec![];
@@ -1628,8 +1833,19 @@ impl<F: PrimeField> OneRowCompiler<F> {
             // final -> NEXT initial
             let i = layout.get(&i).expect("must be compiled");
             let f = layout.get(&f).expect("must be compiled");
+            // 这里保存的是：
+            // (state_output_column, state_input_column)
+            // 含义：
+            // 当前 chunk 的 state_output
+            // 要等于
+            // 下一个 chunk 的 state_input
+            // 这用于多 chunk 证明时连接状态。
             linking_constraints.push((*f, *i));
+            // 第一行的 state_input column 是 public input / boundary input。
+            // 第六章 witness 生成结束后，会从 `exec_trace` 第一行读取这些值。
             public_inputs_first_row.push((BoundaryConstraintLocation::FirstRow, *i));
+            // 倒数第一行真实 cycle 的 state_output column 是 public input / boundary output。
+            // 这里是 `OneBeforeLastRow`，不是 `LastRow`，因为 main RISC-V 每个 chunk 真实 cycle 只使用前 `trace_len - 1` 行。
             public_inputs_one_row_before_last
                 .push((BoundaryConstraintLocation::OneBeforeLastRow, *f));
         }

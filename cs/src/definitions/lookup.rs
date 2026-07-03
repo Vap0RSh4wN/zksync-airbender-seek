@@ -61,7 +61,9 @@ impl<F: PrimeField> LookupExpression<F> {
 pub struct LookupSetDescription<F: PrimeField, const N: usize> {
     #[serde(bound(deserialize = "[LookupExpression<F>; N]: serde::Deserialize<'de>"))]
     #[serde(bound(serialize = "[LookupExpression<F>; N]: serde::Serialize"))]
+    /// lookup row 的 3 个输入/输出表达式，已经从 Variable 转成 ColumnAddress
     pub input_columns: [LookupExpression<F>; N],
+    /// 这次 lookup 查询哪张表
     pub table_index: TableIndex,
 }
 

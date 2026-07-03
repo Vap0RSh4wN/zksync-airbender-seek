@@ -275,12 +275,11 @@ pub trait Machine<F: PrimeField>: 'static + Clone + Default {
     /// funct7: 7 bit  -> 0..127
     /// 总共 2^(7+3+7) = 131072 个 key
     /// 对每个 key，它依次询问 machine 支持的 opcode family：define_decoder_subspace
-    /// 若没有任何 supported opcode 匹配某个 key，produce_decoder_table_stub 保留 basic_invalid_bitmask；opcode_lookup 返回的 is_invalid 就会是 1。
+    /// 若没有任何 supported opcode 匹配某个 key，produce_decoder_table_stub 保留 basic_invalid_bitmask；
+    /// opcode_lookup 返回的 is_invalid 就会是 1。
     /// 所以 OpTypeBitmask 表的返回不是一个大整数，而是两个输出：
-bitmask_0: 前 splitting[0] 个 bit
-bitmask_1: 后 splitting[1] 个 bit
-
-
+    /// bitmask_0: 前 splitting[0] 个 bit
+    /// bitmask_1: 后 splitting[1] 个 bit
     fn produce_decoder_table_stub() -> ([usize; 2], Vec<u64>) {
         // we want to walk over full subspace of u7 x u3 x u7 to collect:
         // - instruction format bits

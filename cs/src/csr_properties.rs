@@ -8,7 +8,8 @@ use field::PrimeField;
 /// 所以这张表不是保存程序代码的。程序代码在RomRead表里。CSR表保存的是“哪些CSR编号有特殊含义”。
 /// main circuit里会遇到CSR相关指令。比如程序里执行某个CSR读写：
 /// CSRRW / CSRRS / CSRRC / CSRRWI / ...
-/// 这时电路要判断这个CSR是不是允许的特殊CSR。如果它是non-determinism CSR，就允许从非确定输入源读数据。如果它是delegation CSR，就允许发起delegation request。不是白名单里的CSR，不能随便当特殊入口使用。
+/// 这时电路要判断这个CSR是不是允许的特殊CSR。如果它是non-determinism CSR，就允许从非确定输入源读数据。
+/// 如果它是delegation CSR，就允许发起delegation request。不是白名单里的CSR，不能随便当特殊入口使用。
 /// 这里和ROM表不同的是：CSR表里的值都很小。CSR编号是12-bit，flag是0/1，因此放进Mersenne31Field没有问题。
 /// 表形状是：
 /// key:

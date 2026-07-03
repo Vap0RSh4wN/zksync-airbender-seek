@@ -19,12 +19,18 @@ impl ShuffleRamInitAndTeardownLayout {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MemorySubtree {
+    /// main RISC-V 有 lazy init / teardown，所以是 Some(...)
     pub shuffle_ram_inits_and_teardowns: Option<ShuffleRamInitAndTeardownLayout>,
+    /// main RISC-V 每行 3 个 shuffle RAM query 的列布局。
     pub shuffle_ram_access_sets: Vec<ShuffleRamQueryColumns>,
+    /// main RISC-V 如果会发 delegation request，这里记录 request 相关列。
     pub delegation_request_layout: Option<DelegationRequestLayout>,
+    /// main RISC-V 自己不是 delegation processor，所以这里是 None。
     pub delegation_processor_layout: Option<DelegationProcessingLayout>,
     pub batched_ram_accesses: Vec<BatchedRamAccessColumns>,
     pub register_and_indirect_accesses: Vec<RegisterAndIndirectAccessDescription>,
+    /// memory subtree 总列数。
+    /// 等于 memory_tree_offset 最终值。
     pub total_width: usize,
 }
 

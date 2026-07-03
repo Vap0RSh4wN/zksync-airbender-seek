@@ -19,22 +19,31 @@ pub enum ShuffleRamAddress {
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ShuffleRamQueryReadColumns {
+    /// 当前访问在 cycle 内的顺序。slot0 = 0，slot1 = 1，slot2 = 2。
     pub in_cycle_write_index: u32,
+    /// 访问地址的列位置
     pub address: ShuffleRamAddress,
+    /// 读取历史 timestamp 的列位置
     pub read_timestamp: ColumnSet<NUM_TIMESTAMP_COLUMNS_FOR_RAM>,
     // // write timestamp will be made form setup
     // pub write_timestamp: Range<usize>,
+    /// 读取值的列位置
     pub read_value: ColumnSet<REGISTER_SIZE>,
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ShuffleRamQueryWriteColumns {
+    /// 当前访问在 cycle 内的顺序。slot0 = 0，slot1 = 1，slot2 = 2。
     pub in_cycle_write_index: u32,
+    /// 访问地址的列位置
     pub address: ShuffleRamAddress,
+    /// 读取历史 timestamp 的列位置
     pub read_timestamp: ColumnSet<NUM_TIMESTAMP_COLUMNS_FOR_RAM>,
     // // write timestamp will be made form setup
     // pub write_timestamp: Range<usize>,
+    /// 读取值的列位置
     pub read_value: ColumnSet<REGISTER_SIZE>,
+    /// 写入值的列位置
     pub write_value: ColumnSet<REGISTER_SIZE>,
 }
 

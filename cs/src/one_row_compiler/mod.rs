@@ -883,6 +883,7 @@ impl quote::ToTokens for BoundaryConstraintLocation {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+/// 是已经编译好的电路布局和约束描述
 pub struct CompiledCircuitArtifact<F: PrimeField> {
     /// witness_layout告诉witness trace怎么排。后面witness evaluator根据执行轨迹，把pc、opcode flags、寄存器值、RAM访问值等写到对应列。
     pub witness_layout: WitnessSubtree<F>,
@@ -1081,6 +1082,12 @@ fn layout_witness_subtree_multiple_variables<const N: usize>(
     columns
 }
 
+/// 把一组 Variable 连续放进 memory subtree。
+/// 1. 从 memory_tree_offset 当前值开始分配列。
+/// 2. 对每个 Variable 插入：Variable -> ColumnAddress::MemorySubtree(offset)
+/// 3. 从 all_variables_to_place 删除这些变量。
+/// 4. 推进 memory_tree_offset。
+/// 5. 返回 ColumnSet，记录这一组变量对应的列范围。
 fn layout_memory_subtree_multiple_variables<const N: usize>(
     offset: &mut usize,
     variables: [Variable; N],

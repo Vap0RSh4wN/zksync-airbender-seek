@@ -39,7 +39,9 @@ impl<F: PrimeField> RegisterLikeDiff<F> {
 
 #[derive(Clone, Debug)]
 pub enum NextPcValue<F: PrimeField> {
+    /// 沿用 `calculate_pc_next_no_overflows` 事先算好的 `pc + 4`。
     Default,
+    /// family 自己给出跳转目标。branch、JAL、JALR 会走这个分支。
     Custom(Register<F>),
 }
 
@@ -67,6 +69,7 @@ impl<F: PrimeField> CommonDiffs<F> {
         let result = std::array::from_fn(|word_idx| {
             let mut flags = vec![];
             let mut variants = vec![];
+            // ADD 行：AddOp、LoadOp、StoreOp 等多数 family 返回 `Default`；`default_case_exec_flags` 含 `is_add`, `is_load`, ... 其中仅 `is_add=1`。
             for el in sources.iter() {
                 for (rd_candidate, flag) in el.rd_value.iter() {
                     let limb_constraint = rd_candidate[word_idx].clone();
