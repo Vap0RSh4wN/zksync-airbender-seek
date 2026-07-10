@@ -2807,86 +2807,137 @@ get_main_riscv_circuit_setup结束时，setup层已经生成以下对象：
 5. setup：SetupPrecomputations，包含setup trace的LDE结果和Merkle trees。
 6. witness_eval_fn_for_gpu_tracer：函数指针，后续witness阶段调用。
 
-## 6. VM入口总览
+## 6. VM和witness入口
 
-setup阶段生成CompiledCircuitArtifact、TableDriver、SetupPrecomputations和witness_eval_fn_for_gpu_tracer。VM阶段使用同一份bytecode运行guest，生成每个cycle的真实执行记录。setup里的Machine描述约束；VM里的RiscV32StateForUnrolledProver更新pc、寄存器和memory。
+setup结束后，main RISC-V证明还缺少每一行CPU执行的真实值。VM阶段运行guest程序，得到每个cycle的pc、寄存器访问、RAM访问、CSR/delegation信息和timestamp。witness阶段把这些VM记录写入CompiledCircuitArtifact指定的列。
 
-VM主线只涉及执行和记录：
+新增的执行顺序如下：
 
 ```mermaid
 flowchart TB
-  bytecode["bytecode"]
-  memory["VectorMemoryImplWithRom"]
-  state["RiscV32StateForUnrolledProver"]
-  tracer["GPUFriendlyTracer"]
-  cycle["CycleData chunks"]
-  teardown["RAM/register final state"]
-  witness["witness边界"]
+  setup["MainCircuitPrecomputations"]
+  compiled["compiled_circuit"]
+  table["table_driver"]
+  evalfn["witness_eval_fn_for_gpu_tracer"]
 
-  bytecode --> memory
-  memory --> state
-  state --> tracer
-  tracer --> cycle
-  tracer --> teardown
-  cycle --> witness
+  run["run_till_end_for_gpu_for_machine_config"]
+  vm["RiscV32StateForUnrolledProver::run_cycles"]
+  tracer["GPUFriendlyTracer"]
+  cycle["CycleData"]
+  lazy["lazy_init_data"]
+
+  oracle["MainRiscVOracle"]
+  witness["evaluate_witness"]
+  proxy["SimpleWitnessProxy"]
+  gen["generated evaluate_witness_fn"]
+  trace["exec_trace + lookup_mapping"]
+
+  setup --> compiled
+  setup --> table
+  setup --> evalfn
+  run --> vm --> tracer --> cycle
+  run --> lazy
+  cycle --> oracle
+  compiled --> witness
+  table --> witness
+  evalfn --> witness
+  lazy --> witness
+  oracle --> witness --> proxy --> gen --> trace
 ```
 
-VM阶段输出三类数据：
+这张图只覆盖VM和witness生成。setup trace、witness trace和lookup_mapping后续会进入prover stages；PCS、FRI、transcript不在本章展开。
 
-1. CycleData：每个cycle的pc、rs1/rs2/rd或RAM访问、read timestamp、non-determinism读值、delegation request。
-2. FinalRegisterValue：每个寄存器的最终值和最后访问timestamp。
-3. RAM teardown data：被访问RAM word的最终值和最后访问timestamp。
+三个对象贯穿VM到witness：
 
-witness阶段只作为边界出现。后续MainRiscVOracle会读取CycleData，evaluate_witness会把CycleData写成field trace。本章不展开SimpleWitnessProxy、generated witness function、lookup_mapping和multiplicity。
+1. CycleData：VM执行记录。GPUFriendlyTracer按cycle写入它。CycleData没有列号。
+2. MainRiscVOracle：把Placeholder解析到CycleData某个字段。MainRiscVOracle不执行指令，也不查固定表。
+3. SimpleWitnessProxy：generated witness function访问witness_row、memory_row、scratch_space、TableDriver和Oracle的接口。
 
-### 6.1 setup对象和VM对象
+> [!TIP]
+>
+> setup阶段已经知道pc_low放在哪一列，也知道RomRead lookup有几个输入和几个输出。VM阶段只给出这一行真实pc。witness阶段把pc拆成low/high，写到setup阶段分配好的列，再用TableDriver查RomRead表，得到low/high opcode并写入列。
 
-setup对象和VM对象共享bytecode和MachineConfig，但执行动作不同。
+### 6.1 setup输出的witness字段
+
+文件：circuit_defs/setups/src/lib.rs
+
+MainCircuitPrecomputations在setup阶段返回，但其中三个字段会被witness阶段消费。
+
+```rust
+// circuit_defs/setups/src/lib.rs
+pub struct MainCircuitPrecomputations<C: MachineConfig, A: GoodAllocator, B: GoodAllocator = Global> {
+    pub compiled_circuit: CompiledCircuitArtifact<Mersenne31Field>,
+    pub table_driver: TableDriver<Mersenne31Field>,
+    pub setup: SetupPrecomputations<DEFAULT_TRACE_PADDING_MULTIPLE, A, DefaultTreeConstructor>,
+    pub witness_eval_fn_for_gpu_tracer: fn(&mut SimpleWitnessProxy<'_, MainRiscVOracle<'_, C, B>>),
+    // 省略代码...
+}
+```
+
+compiled_circuit给witness evaluator提供列布局和已编译约束描述：
+
+1. witness_layout.total_width：execution trace每行的witness subtree宽度。
+2. memory_layout.total_width：execution trace每行的memory subtree宽度。
+3. memory_layout.shuffle_ram_access_sets：每行3个register/RAM访问的列布局。
+4. witness_layout.width_3_lookups：每行generic lookup query数量。
+5. range_check_16_lookup_expressions和timestamp_range_check_lookup_expressions：special lookup multiplicity需要计算的表达式。
+6. public_inputs和state_linkage_constraints：witness生成后读取边界值。
+7. scratch_space_size_for_witness_gen：generated evaluator需要的临时列外空间。
+
+table_driver保存固定表内容。generated witness function调用SimpleWitnessProxy::lookup时，proxy在table_driver中查找固定表行，返回lookup输出，记录absolute table index，并增加multiplicity计数。
+
+witness_eval_fn_for_gpu_tracer是函数指针。它包装circuit_defs/risc_v_cycles/generated/witness_generation_fn.rs里的evaluate_witness_fn。
+
+```rust
+// circuit_defs/risc_v_cycles/src/lib.rs
+pub fn witness_eval_fn_for_gpu_tracer<'a, 'b>(
+    proxy: &'_ mut SimpleWitnessProxy<
+        'a,
+        MainRiscVOracle<'b, IMStandardIsaConfig, impl GoodAllocator>,
+    >,
+) {
+    use prover::cs::cs::witness_placer::scalar_witness_type_set::ScalarWitnessTypeSet;
+
+    let fn_ptr = sealed::evaluate_witness_fn::<
+        ScalarWitnessTypeSet<Mersenne31Field, true>,
+        SimpleWitnessProxy<'a, MainRiscVOracle<'b, IMStandardIsaConfig, _>>,
+    >;
+    (fn_ptr)(proxy);
+}
+```
+
+这个函数不运行VM，不创建CycleData，不分配trace。evaluate_witness为每一行创建SimpleWitnessProxy后调用它。
+
+### 6.2 trace长度和chunk
+
+文件：circuit_defs/risc_v_cycles/src/lib.rs
+
+main RISC-V circuit固定trace高度为DOMAIN_SIZE，真实VM cycle数为NUM_CYCLES。
+
+```rust
+// circuit_defs/risc_v_cycles/src/lib.rs
+pub const DOMAIN_SIZE: usize = 1 << 22;
+pub const NUM_CYCLES: usize = DOMAIN_SIZE - 1;
+```
+
+每个main circuit instance承载DOMAIN_SIZE - 1个真实cycle。最后一行不承载普通CPU cycle。setup trace也用trace_len - 1作为固定表编码容量；witness evaluator同样要求cycles == trace_len - 1。
 
 ```text
-setup侧:
-  get_machine(bytecode)
-  -> CompiledCircuitArtifact
-  -> witness_layout / memory_layout / setup_layout / constraints
-
-VM侧:
-  run_till_end_for_gpu_for_machine_config(bytecode)
-  -> RiscV32StateForUnrolledProver::run_cycles
-  -> CycleData / final registers / RAM teardown
+trace_len = DOMAIN_SIZE
+cycles_per_chunk = trace_len - 1
+cycle row range = 0..cycles_per_chunk
+last row = trace_len - 1
 ```
 
-setup侧不运行guest。VM侧不生成约束，也不创建SetupLayout。VM侧根据RISC-V执行语义更新状态，并通过Tracer<C>回调把执行事件记录下来。
+VM执行时间超过一个chunk时，run_till_end_for_gpu_for_machine_config会把执行记录切成多个CycleData。每个CycleData对应一个main circuit instance。circuit_sequence就是chunk编号，用于timestamp高位区分不同chunk。
 
-### 6.2 本章源码阅读顺序
+## 7. VM执行和chunk切分
 
-VM源码按执行顺序读：
+VM入口位于circuit_defs/trace_and_split/src/lib.rs。run_till_end_for_gpu_for_machine_config接收bytecode、non_determinism、delegation factories、trace_size和worker，返回final pc、main circuit chunks、delegation logs、最终寄存器状态和RAM lazy init/teardown原始数据。
 
-1. circuit_defs/trace_and_split/src/lib.rs
-   读取run_till_end_for_gpu_for_machine_config，确认memory、state、tracer如何创建，chunk如何切分。
-
-2. prover/src/tracer.rs
-   读取VectorMemoryImplWithRom，确认ROM/RAM地址空间和写ROM限制。
-
-3. risc_v_simulator/src/cycle/state_new.rs
-   读取RiscV32StateForUnrolledProver、run_cycles和cycle，确认一条指令如何执行。
-
-4. risc_v_simulator/src/abstractions/tracer.rs
-   读取Tracer<C> trait，确认VM会发出哪些事件。
-
-5. prover/src/tracers/main_cycle_optimized.rs
-   读取GPUFriendlyTracer、SingleCycleTracingData、CycleData、RamTracingData和各个trace_*回调。
-
-6. cs/src/definitions/mod.rs
-   读取timestamp_from_chunk_cycle_and_sequence、TIMESTAMP_STEP和TimestampData。
-
-7. prover/src/tracers/oracles/main_risc_v_circuit.rs
-   只读VM输出边界，确认CycleData后续如何被witness读取。
-
-## 7. run_till_end_for_gpu_for_machine_config
+### 7.1 run_till_end_for_gpu_for_machine_config
 
 文件：circuit_defs/trace_and_split/src/lib.rs
-
-run_till_end_for_gpu_for_machine_config是VM带tracer运行的工程入口。它创建VectorMemoryImplWithRom，把bytecode写入ROM区域，创建RiscV32StateForUnrolledProver，创建GPUFriendlyTracer，然后按chunk调用state.run_cycles。
 
 ```rust
 // circuit_defs/trace_and_split/src/lib.rs
@@ -2902,13 +2953,13 @@ pub fn run_till_end_for_gpu_for_machine_config<
     non_determinism: &mut ND,
     delegation_factories: HashMap<u16, Box<dyn Fn() -> DelegationWitness<A>>>,
     worker: &Worker,
-+) -> (
+) -> (
     u32,
     Vec<CycleData<C, A>>,
     HashMap<u16, Vec<DelegationWitness<A>>>,
     Vec<FinalRegisterValue>,
     Vec<Vec<(u32, (TimestampScalar, u32))>>,
-+) {
+) {
     assert!(trace_size.is_power_of_two());
     let rom_address_space_bound = 1usize << (16 + ROM_ADDRESS_SPACE_SECOND_WORD_BITS);
 
@@ -2943,786 +2994,120 @@ pub fn run_till_end_for_gpu_for_machine_config<
             break;
         };
     }
-    // 省略返回值整理...
+    // 省略代码...
 }
 ```
 
-本地动作按顺序发生：
+本地状态变化按顺序发生：
 
-1. trace_size必须是2的幂。main RISC-V setup里trace_size对应DOMAIN_SIZE。
-2. rom_address_space_bound根据ROM_ADDRESS_SPACE_SECOND_WORD_BITS计算，和setup里的RomRead表地址范围一致。
-3. VectorMemoryImplWithRom创建1GB RAM，并保留rom_bound之前的地址作为ROM范围。
-4. binary按ENTRY_POINT + idx * 4写入memory。ENTRY_POINT为0。
-5. cycles_per_chunk = trace_size - 1。一个main circuit instance承载trace_size - 1个真实cycle。
-6. RiscV32StateForUnrolledProver::initial(ENTRY_POINT)创建初始VM状态。
-7. GPUFriendlyTracer创建CycleData chunk、timestamp bookkeeping和delegation tracing data。
-8. 每个chunk调用state.run_cycles，VM执行cycles_per_chunk条指令。
-9. chunk_idx递增时，prepare_for_next_chunk保存当前CycleData并创建下一块CycleData。
-10. finished为true后退出循环，函数整理最终寄存器状态、delegation logs和RAM teardown数据。
+1. VectorMemoryImplWithRom创建1GB RAM和ROM地址空间。
+2. binary按4字节间隔写入memory，入口地址ENTRY_POINT为0。
+3. cycles_per_chunk设为trace_size - 1。
+4. RiscV32StateForUnrolledProver::initial(ENTRY_POINT)创建VM状态。
+5. GPUFriendlyTracer创建当前chunk的CycleData和RAM/register timestamp bookkeeping。
+6. state.run_cycles执行VM，模拟器在每个cycle调用tracer回调。
+7. chunk结束时prepare_for_next_chunk把旧CycleData推进traced_chunks，并创建新的CycleData。
+8. VM结束后，函数返回traced_chunks、最终register状态和被访问RAM word的teardown数据。
 
-### 7.1 trace_size和chunk
+run_cycles是真正执行guest的位置。Machine::describe_state_transition只描述约束，run_cycles读取memory、更新register、执行branch/load/store/CSR，并调用Tracer<C>记录事件。
 
-trace_size是电路trace高度。VM真实cycle数量使用trace_size - 1。
+### 7.2 VM内存与ROM边界
+
+run_till_end_for_gpu_for_machine_config把bytecode写入VectorMemoryImplWithRom的ROM区域。ROM bound来自setup时的ROM_ADDRESS_SPACE_SECOND_WORD_BITS。
 
 ```text
-trace_size = DOMAIN_SIZE
-cycles_per_chunk = trace_size - 1
-num_circuits_upper_bound = ceil(num_cycles_upper_bound / cycles_per_chunk)
+rom_address_space_bound = 1 << (16 + ROM_ADDRESS_SPACE_SECOND_WORD_BITS)
+instruction address = ENTRY_POINT + idx * 4
 ```
 
-CycleData只保存真实cycle行，不保存最后一行。最后一行留给后续trace形状和边界处理。
+VM执行取指时，trace_opcode_read不记录到CycleData，因为main circuit取指通过RomRead lookup证明，opcode不走shuffle RAM。
+
+```rust
+// prover/src/tracers/main_cycle_optimized.rs
+fn trace_opcode_read(&mut self, _phys_address: u64, _read_value: u32) {
+    // Nothing, opcodes are expected to be read from ROM
+}
+```
+
+RAM load如果读到ROM地址范围，tracer把这次RAM read替换为address=0、read_value=0。源码这样处理：
+
+```rust
+// prover/src/tracers/main_cycle_optimized.rs
+fn trace_ram_read(&mut self, phys_address: u64, read_value: u32) {
+    let (address, read_value) = if phys_address < self.bookkeeping_aux_data.rom_bound as u64 {
+        // ROM read, substituted as read 0 from 0
+        (0, 0)
+    } else {
+        (phys_address, read_value)
+    };
+    // 省略代码...
+}
+```
+
+main circuit的指令来源只通过RomRead固定表约束。普通RAM访问不允许写ROM；trace_ram_read_write里直接assert phys_address >= rom_bound。
+
+### 7.3 timestamp编号
+
+文件：cs/src/definitions/mod.rs、cs/src/definitions/constants.rs
+
+timestamp用于memory argument。每个chunk有自己的timestamp高位，每个cycle有固定步长，每个cycle内部的访问slot使用低两位区分。
+
+```rust
+// cs/src/definitions/mod.rs
+pub const INITIAL_TIMESTAMP_AT_CHUNK_START: TimestampScalar = 4;
+pub const TIMESTAMP_STEP: TimestampScalar = 1 << NUM_EMPTY_BITS_FOR_RAM_TIMESTAMP;
+
+pub const fn timestamp_from_chunk_cycle_and_sequence(
+    cycle_in_chunk: usize,
+    chunk_capacity: usize,
+    circuit_sequence: usize,
+) -> TimestampScalar {
+    let trace_len = chunk_capacity + 1;
+
+    let timestamp = INITIAL_TIMESTAMP_AT_CHUNK_START
+        + TIMESTAMP_STEP * (cycle_in_chunk as TimestampScalar)
+        + timestamp_high_contribution_from_circuit_sequence(circuit_sequence, trace_len);
+
+    timestamp
+}
+
+pub const fn timestamp_high_contribution_from_circuit_sequence(
+    circuit_sequence: usize,
+    trace_len: usize,
+) -> TimestampScalar {
+    (circuit_sequence as TimestampScalar)
+        << (trace_len.trailing_zeros() + NUM_EMPTY_BITS_FOR_RAM_TIMESTAMP)
+}
+```
+
+NUM_EMPTY_BITS_FOR_RAM_TIMESTAMP等于2，给一个cycle内最多4个事件编号。main RISC-V使用0、1、2三个编号：
+
+```text
+RS1_ACCESS_IDX = 0
+RS2_ACCESS_IDX = 1
+RD_ACCESS_IDX  = 2
+DELEGATION_ACCESS_IDX = 3
+
+write_timestamp(slot i) = current_timestamp + i
+current_timestamp(next cycle) = current_timestamp + TIMESTAMP_STEP
+TIMESTAMP_STEP = 4
+```
+
+setup trace中timestamp_setup_columns只保存每行的base timestamp，不保存slot编号。process_shuffle_ram_accesses写witness时，会把setup timestamp和access_idx组合成write timestamp。
 
 > [!TIP]
 >
-> 如果trace_size = 8，一个chunk最多执行7个VM cycle。CycleData.per_cycle_data长度最终等于7。后续witness trace高度仍然是8，第8行不对应真实指令。
+> 第0行cycle的base timestamp是4。slot0写timestamp是4，slot1是5，slot2是6。第1行cycle的base timestamp是8，slot0是8，slot1是9，slot2是10。低两位留给cycle内顺序，cycle之间相差4。
 
-### 7.2 初始timestamp
-
-run_till_end_for_gpu_for_machine_config用timestamp_from_chunk_cycle_and_sequence创建第一个chunk的初始timestamp。
-
-```rust
-// circuit_defs/trace_and_split/src/lib.rs
-let initial_ts = timestamp_from_chunk_cycle_and_sequence(0, cycles_per_chunk, 0);
-let mut tracer = GPUFriendlyTracer::<_, _, true, true, true>::new(
-    initial_ts,
-    bookkeeping_aux_data,
-    delegation_tracer,
-    cycles_per_chunk,
-    num_circuits_upper_bound,
-);
-```
-
-chunk切换时，chunk_idx进入timestamp高位：
-
-```rust
-let timestamp = timestamp_from_chunk_cycle_and_sequence(0, cycles_per_chunk, chunk_idx);
-tracer.prepare_for_next_chunk(timestamp);
-```
-
-同一个chunk内部，GPUFriendlyTracer在每个cycle末尾把current_timestamp加TIMESTAMP_STEP。不同chunk之间，timestamp_high_contribution_from_circuit_sequence把chunk编号移入高位，避免不同chunk出现相同timestamp。
-
-### 7.3 返回值
-
-run_till_end_for_gpu_for_machine_config返回五个对象：
-
-```text
-final pc:
-  state.observable.pc
-
-main traces:
-  Vec<CycleData<C, A>>
-
-all_per_type_logs:
-  HashMap<u16, Vec<DelegationWitness<A>>>
-
-register final states:
-  Vec<FinalRegisterValue>
-
-RAM lazy init / teardown source data:
-  Vec<Vec<(phys_address, (last_timestamp, final_value))>>
-```
-
-RAM teardown数据来自access_bitmask。GPUFriendlyTracer每次访问RAM word时会在access_bitmask中标记该word。VM结束后，函数遍历access_bitmask，把被访问过的RAM word最终值和最后timestamp收集出来。
-
-```rust
-// circuit_defs/trace_and_split/src/lib.rs
-let memory_final_state = memory.get_final_ram_state();
-let ram_words_last_live_timestamps_ref = &ram_words_last_live_timestamps;
-
-for (idx, word) in src.iter().enumerate() {
-    for bit_idx in 0..usize::BITS {
-        let word_idx = (chunk_start + idx) * (usize::BITS as usize) + (bit_idx as usize);
-        let phys_address = word_idx << 2;
-        let word_is_used = *word & (1 << bit_idx) > 0;
-        if word_is_used {
-            let word_value = memory_state_ref[word_idx];
-            let last_timestamp = ram_words_last_live_timestamps_ref[word_idx];
-            el.push((phys_address as u32, (last_timestamp, word_value)));
-        }
-    }
-}
-```
-
-这一步产生的是VM执行后的RAM最终状态摘要。后续chunk_lazy_init_and_teardown会把它整理成每个chunk的lazy_init_data。
-
-## 8. VectorMemoryImplWithRom
-
-文件：prover/src/tracer.rs
-
-VectorMemoryImplWithRom实现MemorySource。它用同一个Vec<u32>保存ROM和RAM，但rom_bound之前的地址被视为ROM范围。
-
-```rust
-// prover/src/tracer.rs
-pub struct VectorMemoryImplWithRom {
-    ram: Vec<u32>,
-    pub rom_bound: usize,
-}
-
-impl VectorMemoryImplWithRom {
-    pub fn new_for_byte_size(bytes: usize, rom_bound: usize) -> Self {
-        assert!(rom_bound.is_power_of_two());
-        assert_eq!(rom_bound % 4, 0);
-        assert_eq!(bytes % 4, 0);
-        assert!(bytes >= rom_bound);
-        let allocation_size = std::cmp::max(rom_bound, bytes);
-
-        Self {
-            ram: vec![0u32; allocation_size / 4],
-            rom_bound,
-        }
-    }
-
-    pub fn populate(&mut self, address: u32, value: u32) {
-        assert!(address % 4 == 0);
-        self.ram[(address / 4) as usize] = value;
-    }
-
-    pub fn get_final_ram_state(self) -> Vec<u32> {
-        let Self { ram, rom_bound } = self;
-        let mut ram = ram;
-        let rom_words = rom_bound / 4;
-        ram[..rom_words].fill(0);
-        ram
-    }
-}
-```
-
-populate在run_till_end_for_gpu_for_machine_config中用于写入bytecode：
-
-```text
-address = ENTRY_POINT + idx * 4
-value = binary[idx]
-```
-
-get_final_ram_state返回RAM最终状态时会清零ROM范围。ROM指令已经由setup阶段的RomRead固定表处理，RAM teardown不需要暴露ROM内容。
-
-### 8.1 MemorySource::get
-
-MemorySource::get处理instruction read、load和store相关读。
-
-```rust
-// prover/src/tracer.rs
-impl MemorySource for VectorMemoryImplWithRom {
-    fn get(&self, phys_address: u64, access_type: AccessType, trap: &mut TrapReason) -> u32 {
-        if phys_address < self.rom_bound as u64 {
-            assert!(access_type == AccessType::Instruction || access_type == AccessType::MemLoad);
-            self.ram[(phys_address / 4) as usize]
-        } else if ((phys_address / 4) as usize) < self.ram.len() {
-            self.ram[(phys_address / 4) as usize]
-        } else {
-            match access_type {
-                AccessType::Instruction => *trap = TrapReason::InstructionAccessFault,
-                AccessType::MemLoad => *trap = TrapReason::LoadAccessFault,
-                AccessType::MemStore => *trap = TrapReason::StoreOrAMOAccessFault,
-                _ => unreachable!(),
-            }
-            0
-        }
-    }
-}
-```
-
-ROM范围允许Instruction和MemLoad读取。写入ROM范围会panic。
-
-### 8.2 MemorySource::set
-
-```rust
-// prover/src/tracer.rs
-fn set(
-    &mut self,
-    phys_address: u64,
-    value: u32,
-    access_type: AccessType,
-    trap: &mut TrapReason,
-) {
-    if phys_address < self.rom_bound as u64 {
-        panic!(
-            "can not set ROM range: requested write into {}, but ROM bound is {}",
-            phys_address, self.rom_bound
-        );
-    } else if ((phys_address / 4) as usize) < self.ram.len() {
-        self.ram[(phys_address / 4) as usize] = value;
-    } else {
-        match access_type {
-            AccessType::Instruction => *trap = TrapReason::InstructionAccessFault,
-            AccessType::MemLoad => *trap = TrapReason::LoadAccessFault,
-            AccessType::MemStore => *trap = TrapReason::StoreOrAMOAccessFault,
-            _ => unreachable!(),
-        }
-    }
-}
-```
-
-VM执行store时，MemorySource::set拒绝写ROM。GPUFriendlyTracer::trace_ram_read_write也有同样检查。两处检查覆盖模拟器写内存和tracer记录两条路径。
-
-### 8.3 opcode读取
-
-get_opcode_noexcept只允许从ROM范围读取opcode。
-
-```rust
-// prover/src/tracer.rs
-fn get_opcode_noexcept(&self, phys_address: u64) -> u32 {
-    debug_assert!(phys_address % 4 == 0);
-    debug_assert!(
-        phys_address < self.rom_bound as u64,
-        "Out of bound opcode access at address 0x{:x}",
-        phys_address
-    );
-    unsafe { *self.ram.get_unchecked((phys_address / 4) as usize) }
-}
-```
-
-VM使用VectorMemoryImplWithRom运行guest，setup使用RomRead固定表约束取指。两者都读取同一份bytecode，但路径不同：VM读取memory.ram，setup/prove读取TableDriver和setup trace。
-
-## 9. RiscV32StateForUnrolledProver
-
-文件：risc_v_simulator/src/cycle/state_new.rs
-
-RiscV32StateForUnrolledProver保存VM可观察状态：32个寄存器和pc。
-
-```rust
-// risc_v_simulator/src/cycle/state_new.rs
-pub struct RiscV32StateForUnrolledProver<Config: MachineConfig = IMStandardIsaConfig> {
-    pub observable: RiscV32ObservableState,
-    _marker: std::marker::PhantomData<Config>,
-}
-
-impl<Config: MachineConfig> RiscV32StateForUnrolledProver<Config> {
-    pub fn initial(initial_pc: u32) -> Self {
-        let registers = [0u32; NUM_REGISTERS];
-        let pc = initial_pc;
-
-        Self {
-            observable: RiscV32ObservableState { registers, pc },
-            _marker: std::marker::PhantomData,
-        }
-    }
-}
-```
-
-set_register保留RISC-V x0规则。写x0时，value被改成0，并返回旧值。
-
-```rust
-pub fn set_register(&mut self, reg_idx: u32, mut value: u32) -> u32 {
-    if reg_idx == 0 {
-        value = 0;
-    }
-    let dst = self.observable.registers.get_unchecked_mut(reg_idx as usize);
-    let existing = *dst;
-    *dst = value;
-    existing
-}
-```
-
-### 9.1 run_cycles
-
-run_cycles循环调用cycle。只要某个cycle返回true，finished_execution就变成true；函数仍然执行完num_cycles次循环。
-
-```rust
-// risc_v_simulator/src/cycle/state_new.rs
-pub fn run_cycles<
-    M: MemorySource,
-    TR: Tracer<Config>,
-    ND: NonDeterminismCSRSource<M>,
-    CSR: DelegationCSRProcessor,
->(
-    &mut self,
-    memory_source: &mut M,
-    tracer: &mut TR,
-    non_determinism_source: &mut ND,
-    csr_processor: &mut CSR,
-    num_cycles: usize,
-) -> bool {
-    let mut finished_execution = false;
-
-    for _cycle in 0..num_cycles {
-        if self.cycle(memory_source, tracer, non_determinism_source, csr_processor) {
-            finished_execution = true;
-        }
-    }
-
-    finished_execution
-}
-```
-
-cycle返回true的条件是当前cycle结束后的pc等于cycle开始前的pc：
-
-```rust
-self.observable.pc == pc
-```
-
-Airbender guest通常用jal x0, 0作为停止指令。该指令让pc跳回自身，run_cycles观察到pc不变后返回finished。
-run_cycles仍会继续执行到num_cycles结束。停止指令之后，本chunk剩余cycle继续执行同一个自循环指令，用固定长度CycleData填满trace_size - 1行。
-
-### 9.2 cycle整体结构
-
-cycle执行一条指令。代码顺序如下：
-
-```rust
-// risc_v_simulator/src/cycle/state_new.rs
-pub fn cycle<
-    M: MemorySource,
-    TR: Tracer<Config>,
-    ND: NonDeterminismCSRSource<M>,
-    CSR: DelegationCSRProcessor,
->(
-    &mut self,
-    memory_source: &mut M,
-    tracer: &mut TR,
-    non_determinism_source: &mut ND,
-    csr_processor: &mut CSR,
-) -> bool {
-    tracer.at_cycle_start_ext(&*self);
-
-    let opcode = self.decoder_step(memory_source, tracer);
-
-    let rd = get_rd_bits(opcode);
-    let formal_rs1 = get_formal_rs1_bits(opcode);
-    let formal_rs2 = get_formal_rs2_bits(opcode);
-    let op = get_opcode_bits(opcode);
-    let funct3 = funct3_bits(opcode);
-    let funct7 = funct7_bits(opcode);
-
-    let pc = self.observable.pc;
-    self.observable.pc = self.observable.pc.wrapping_add(4);
-
-    let rs1_value = self.get_register(formal_rs1 as u32);
-    tracer.trace_rs1_read(formal_rs1 as u32, rs1_value);
-    let rs2_value = if op != OPCODE_LOAD {
-        let rs2_value = self.get_register(formal_rs2 as u32);
-        tracer.trace_rs2_read(formal_rs2 as u32, rs2_value);
-        rs2_value
-    } else {
-        0
-    };
-
-    match op {
-        // 各opcode family...
-    }
-
-    self.count_new_cycle_for_markers();
-    tracer.at_cycle_end_ext(&*self);
-
-    self.observable.pc == pc
-}
-```
-
-关键顺序：
-
-1. at_cycle_start_ext先记录cycle开始时的pc。
-2. decoder_step读取opcode。
-3. 解析rd、rs1、rs2、opcode、funct3、funct7。
-4. 保存旧pc到pc变量，然后默认pc += 4。
-5. 必定读取rs1并调用trace_rs1_read。
-6. 非LOAD指令读取rs2并调用trace_rs2_read。
-7. match op执行具体指令，可能写rd、读写RAM、处理CSR或改pc。
-8. at_cycle_end_ext推进timestamp并增加cycles_traced。
-9. 返回pc是否保持不变。
-
-> [!TIP]
->
-> LOAD在cycle前半段不调用trace_rs2_read，因为slot1会留给RAM read。STORE会读取rs2，因为rs2保存要写入RAM的数据，slot1仍是register read。
-
-### 9.3 decoder_step和opcode读取
-
-```rust
-fn decoder_step<M: MemorySource, TR: Tracer<Config>>(
-    &mut self,
-    memory_source: &mut M,
-    tracer: &mut TR,
-) -> u32 {
-    let opcode = opcode_read(self.observable.pc, memory_source);
-    opcode
-}
-```
-
-opcode_read通过MemorySource读取当前pc处的指令。GPUFriendlyTracer::trace_opcode_read为空实现，main circuit不把opcode read记入CycleData。指令来源由setup里的RomRead固定表约束。
-
-## 10. opcode执行路径
-
-cycle里的match op覆盖main RISC-V支持的opcode family。这里按执行事件解释，不展开所有位运算约束。
-
-### 10.1 LUI和AUIPC
-
-LUI和AUIPC使用U-type immediate，计算rd_value后写rd。
-
-```rust
-OPCODE_LUI => {
-    let imm = UTypeOpcode::imm(opcode);
-    let rd_value = imm;
-    let rd_old_value = self.set_register(rd, rd_value);
-    tracer.trace_rd_write(rd, rd_old_value, rd_value);
-}
-OPCODE_AUIPC => {
-    let imm = UTypeOpcode::imm(opcode);
-    let rd_value = pc.wrapping_add(imm);
-    let rd_old_value = self.set_register(rd, rd_value);
-    tracer.trace_rd_write(rd, rd_old_value, rd_value);
-}
-```
-
-CycleData变化：
-
-```text
-slot0 = rs1 register read，虽然U-type语义不使用rs1
-slot1 = rs2 register read，非LOAD路径已经读取rs2
-slot2 = rd register write
-pc_out = pc + 4
-```
-
-setup约束会用format flags门控无用读值。VM为了保持每行固定3个shuffle RAM slot，仍然记录rs1/rs2/rd相关访问。
-
-### 10.2 JAL和JALR
-
-JAL和JALR写rd为返回地址，并修改pc。
-
-```rust
-OPCODE_JAL => {
-    let mut imm: u32 = JTypeOpcode::imm(opcode);
-    sign_extend(&mut imm, 21);
-    let rd_value = self.observable.pc; // pc + 4
-    let jmp_addr = pc.wrapping_add(imm);
-
-    if jmp_addr & 0x3 != 0 {
-        panic!("Unaligned jump address 0x{:08x}", jmp_addr);
-    } else {
-        self.observable.pc = jmp_addr;
-    }
-
-    let rd_old_value = self.set_register(rd, rd_value);
-    tracer.trace_rd_write(rd, rd_old_value, rd_value);
-}
-```
-
-JALR用rs1_value加I-type immediate，并清最低bit：
-
-```rust
-let jmp_addr = rs1_value.wrapping_add(imm) & !0x1;
-```
-
-VM直接panic处理未对齐jump。main circuit没有异常处理路径；异常类行为会导致VM或约束失败。
-
-### 10.3 BRANCH
-
-BRANCH已经在cycle前半段读取rs1和rs2。它根据funct3比较两个操作数，成立时改pc。BRANCH不写真实rd，VM会把slot2记录成x0写0。
-
-```rust
-OPCODE_BRANCH => {
-    let mut imm = BTypeOpcode::imm(opcode);
-    sign_extend(&mut imm, 13);
-    let jmp_addr = pc.wrapping_add(imm);
-
-    let should_jump = match funct3 {
-        0 => rs1_value == rs2_value,
-        1 => rs1_value != rs2_value,
-        4 => (rs1_value as i32) < (rs2_value as i32),
-        5 => (rs1_value as i32) >= (rs2_value as i32),
-        6 => rs1_value < rs2_value,
-        7 => rs1_value >= rs2_value,
-        _ => panic!("Unknown opcode 0x{:08x}", opcode),
-    };
-
-    if should_jump {
-        self.observable.pc = jmp_addr;
-    }
-
-    let rd = 0;
-    let rd_old_value = self.get_register(rd);
-    tracer.trace_rd_write(rd, rd_old_value, 0);
-}
-```
-
-CycleData变化：
-
-```text
-slot0 = rs1 register read
-slot1 = rs2 register read
-slot2 = x0 write 0
-pc_out = jmp_addr or pc + 4
-```
-
-slot2写x0让main circuit每行保持3个shuffle RAM access。writeback约束会用B-format flag把slot2清空。
-
-### 10.4 OP-IMM和OP
-
-OP-IMM使用rs1和立即数，OP使用rs1和rs2。两类指令都会写rd。
-
-OP-IMM示例：
-
-```rust
-OP_IMM_SUBMASK => {
-    let operand_1 = rs1_value;
-    let mut imm = ITypeOpcode::imm(opcode);
-    sign_extend(&mut imm, 12);
-    let operand_2 = imm;
-    let rd_value = match funct3 {
-        0b000 => operand_1.wrapping_add(operand_2),
-        0b001 if funct7 == SLL_FUNCT7 => operand_1 << (operand_2 & 0x1f),
-        0b101 if funct7 == SRL_FUNCT7 => operand_1 >> (operand_2 & 0x1f),
-        0b010 => ((operand_1 as i32) < (operand_2 as i32)) as u32,
-        0b011 => (operand_1 < operand_2) as u32,
-        0b100 => operand_1 ^ operand_2,
-        0b110 => operand_1 | operand_2,
-        0b111 => operand_1 & operand_2,
-        _ => panic!("Unknown opcode 0x{:08x}", opcode),
-    };
-
-    let rd_old_value = self.set_register(rd, rd_value);
-    tracer.trace_rd_write(rd, rd_old_value, rd_value);
-}
-```
-
-OP包含ADD、SUB、shift、comparison、bitwise，以及M extension的mul/div/rem分支。Config决定SUPPORT_MUL、SUPPORT_DIV、SUPPORT_SIGNED_MUL、SUPPORT_SIGNED_DIV等能力。unsupported opcode会panic。
-
-CycleData变化：
-
-```text
-OP-IMM:
-  slot0 = rs1 register read
-  slot1 = rs2 register read，VM仍记录formal rs2
-  slot2 = rd register write
-
-OP:
-  slot0 = rs1 register read
-  slot1 = rs2 register read
-  slot2 = rd register write
-```
-
-### 10.5 LOAD
-
-LOAD跳过cycle前半段的trace_rs2_read，把slot1留给RAM read。
-
-```rust
-OPCODE_LOAD => {
-    let mut imm = ITypeOpcode::imm(opcode);
-    sign_extend(&mut imm, 12);
-
-    let load_address = rs1_value.wrapping_add(imm);
-
-    match funct3 {
-        a @ 0 | a @ 1 | a @ 2 | a @ 4 | a @ 5 => {
-            let num_bytes = match a {
-                0 | 4 => 1,
-                1 | 5 => 2,
-                2 => 4,
-                _ => unsafe { unreachable_unchecked() },
-            };
-            let (aligned_ram_read_value, ram_read_value) =
-                mem_read::<M, Config>(memory_source, load_address as u64, num_bytes);
-            tracer.trace_ram_read((load_address & !0x3) as u64, aligned_ram_read_value);
-            let rd_value = match a {
-                0 => sign_extend_8(ram_read_value),
-                1 => sign_extend_16(ram_read_value),
-                2 => ram_read_value,
-                4 => zero_extend_8(ram_read_value),
-                5 => zero_extend_16(ram_read_value),
-                _ => unsafe { unreachable_unchecked() },
-            };
-
-            let rd_old_value = self.set_register(rd, rd_value);
-            tracer.trace_rd_write(rd, rd_old_value, rd_value);
-        }
-        _ => panic!("Unknown opcode 0x{:08x}", opcode),
-    }
-}
-```
-
-LOAD访问顺序：
-
-```text
-slot0:
-  trace_rs1_read(base register)
-
-slot1:
-  trace_ram_read(aligned address, aligned word)
-
-slot2:
-  trace_rd_write(rd, old rd value, loaded value)
-```
-
-mem_read返回两个值：aligned_ram_read_value和ram_read_value。tracer记录aligned word，因为memory argument按4字节word追踪。rd写回值使用按funct3截取和扩展后的ram_read_value。
-
-> [!TIP]
->
-> LB读取一个byte，但CycleData的slot1仍记录对齐后的32-bit RAM word。电路里的load约束会根据地址低位和funct3选择目标byte，并做sign/zero extension。
-
-### 10.6 STORE
-
-STORE在cycle前半段已经读取rs1和rs2。rs1给base address，rs2给store value。STORE不写rd；slot2会被RAM write占用。
-
-```rust
-OPCODE_STORE => {
-    let mut imm = STypeOpcode::imm(opcode);
-    sign_extend(&mut imm, 12);
-
-    let store_address = rs1_value.wrapping_add(imm);
-
-    match funct3 {
-        a @ 0 | a @ 1 | a @ 2 => {
-            let store_length = 1 << a;
-
-            let (aligned_ram_old_value, aligned_ram_write_value) = mem_write::<M, Config>(
-                memory_source,
-                store_address as u64,
-                rs2_value,
-                store_length,
-            );
-            tracer.trace_ram_read_write(
-                (store_address & !0x3) as u64,
-                aligned_ram_old_value,
-                aligned_ram_write_value,
-            );
-        }
-        _ => panic!("Unknown opcode 0x{:08x}", opcode),
-    }
-}
-```
-
-STORE访问顺序：
-
-```text
-slot0:
-  trace_rs1_read(base register)
-
-slot1:
-  trace_rs2_read(value register)
-
-slot2:
-  trace_ram_read_write(aligned address, old aligned word, new aligned word)
-```
-
-mem_write处理SB、SH、SW的字节合成，返回旧aligned word和新aligned word。tracer记录新旧word。电路里的store约束会检查新word是否由旧word和rs2_value按store_length合成。
-
-### 10.7 SYSTEM、non-determinism CSR和delegation CSR
-
-SYSTEM路径只支持部分CSR和MOP。CSR路径处理NON_DETERMINISM_CSR、MARKER_CSR和delegation CSRs。
-
-```rust
-OPCODE_SYSTEM => {
-    const ZICSR_MASK: u8 = 0x3;
-    const ZIMOP_FUNCT3: u8 = 0b100;
-
-    if funct3 == ZIMOP_FUNCT3 {
-        // MOP路径，按Config::SUPPORT_MOPS处理
-    } else if funct3 & ZICSR_MASK != 0 {
-        assert!(Config::SUPPORT_STANDARD_CSRS == false);
-        assert!(Config::SUPPORT_ONLY_CSRRW);
-
-        let csr_number = ITypeOpcode::imm(opcode);
-        let mut rd_value = 0;
-        let mut delegation_type = 0u16;
-
-                    match csr_number {
-                        NON_DETERMINISM_CSR => {
-                            rd_value = if ND::SHOULD_MOCK_READS_BEFORE_WRITES {
-                                if rd == 0 {
-                                    0
-                                } else {
-                                    non_determinism_source.read()
-                                }
-                            } else {
-                                non_determinism_source.read()
-                            };
-                            tracer.trace_non_determinism_read(rd_value);
-                        }
-                        MARKER_CSR => {}
-                        delegation_csr => {
-                            debug_assert!(Config::ALLOWED_DELEGATION_CSRS.contains(&delegation_csr));
-                        }
-                    }
-
-        if funct3 != 0b001 {
-            panic!("Unknown opcode 0x{:08x}", opcode);
-        }
-
-                    match csr_number {
-                        NON_DETERMINISM_CSR => {
-                            delegation_type = NON_DETERMINISM_CSR as u16;
-                            if ND::SHOULD_IGNORE_WRITES_AFTER_READS {
-                                if formal_rs1 != 0 {
-                                    non_determinism_source
-                                        .write_with_memory_access(&*memory_source, rs1_value);
-                                }
-                            } else {
-                                non_determinism_source
-                                    .write_with_memory_access(&*memory_source, rs1_value);
-                            }
-                            tracer.trace_non_determinism_write(rs1_value);
-                        }
-            MARKER_CSR => self.add_marker(),
-            delegation_csr => {
-                csr_processor.process_write(
-                    self,
-                    delegation_csr as u16,
-                    memory_source,
-                    non_determinism_source,
-                    tracer,
-                );
-                delegation_type = delegation_csr as u16;
-            }
-        }
-
-        if delegation_type != NON_DETERMINISM_CSR as u16 {
-            assert_eq!(rd_value, 0);
-        }
-
-        let rd_old_value = self.set_register(rd, rd_value);
-        tracer.trace_rd_write(rd, rd_old_value, rd_value);
-    } else {
-        panic!("Unknown opcode 0x{:08x}", opcode);
-    }
-}
-```
-
-non-determinism CSR读取NonDeterminismCSRSource，写入CycleData.non_determinism_read。ND::SHOULD_MOCK_READS_BEFORE_WRITES为true且rd为0时，源码把rd_value置0，不调用read。ND::SHOULD_IGNORE_WRITES_AFTER_READS为true且formal_rs1为0时，源码跳过write_with_memory_access。tracer.trace_non_determinism_write仍然记录rs1_value。
-
-delegation CSR调用csr_processor.process_write，processor会调用tracer.record_delegation记录delegation request及其register/RAM访问。SYSTEM路径最后仍然trace_rd_write，把rd写回记录到slot2，delegation CSR要求rd_value为0。
-
-## 11. Tracer<C>接口
-
-文件：risc_v_simulator/src/abstractions/tracer.rs
-
-Tracer<C>是VM向外报告执行事件的接口。默认实现为空，GPUFriendlyTracer覆盖main RISC-V witness需要的回调。
-
-```rust
-// risc_v_simulator/src/abstractions/tracer.rs
-pub trait Tracer<C: MachineConfig>: Sized {
-    fn at_cycle_start_ext(&mut self, _current_state: &RiscV32StateForUnrolledProver<C>) {}
-    fn at_cycle_end_ext(&mut self, _current_state: &RiscV32StateForUnrolledProver<C>) {}
-
-    fn trace_opcode_read(&mut self, _phys_address: u64, _read_value: u32) {}
-    fn trace_rs1_read(&mut self, _reg_idx: u32, _read_value: u32) {}
-    fn trace_rs2_read(&mut self, _reg_idx: u32, _read_value: u32) {}
-    fn trace_rd_write(&mut self, _reg_idx: u32, _read_value: u32, _written_value: u32) {}
-
-    fn trace_non_determinism_read(&mut self, _read_value: u32) {}
-    fn trace_non_determinism_write(&mut self, _written_value: u32) {}
-
-    fn trace_ram_read(&mut self, _phys_address: u64, _read_value: u32) {}
-    fn trace_ram_read_write(&mut self, _phys_address: u64, _read_value: u32, _written_value: u32) {}
-
-    fn record_delegation(
-        &mut self,
-        _access_id: u32,
-        _base_register: u32,
-        _register_accesses: &mut [RegisterOrIndirectReadWriteData],
-        _indirect_read_addresses: &[u32],
-        _indirect_reads: &mut [RegisterOrIndirectReadData],
-        _indirect_write_addresses: &[u32],
-        _indirect_writes: &mut [RegisterOrIndirectReadWriteData],
-    ) {}
-}
-```
-
-VM执行语义和tracer记录分离。RiscV32StateForUnrolledProver更新状态；Tracer<C>接收执行事件。使用空tracer运行时，VM只执行guest，不生成CycleData。
-
-## 12. GPUFriendlyTracer和CycleData
+## 8. GPUFriendlyTracer和CycleData
 
 文件：prover/src/tracers/main_cycle_optimized.rs
 
-GPUFriendlyTracer实现Tracer<C>。它把每个cycle记录成SingleCycleTracingData，并维护RAM/register最后访问timestamp。
+GPUFriendlyTracer实现risc_v_simulator的Tracer<C> trait。VM每执行一条指令，会按执行路径调用at_cycle_start_ext、trace_rs1_read、trace_rs2_read、trace_rd_write、trace_ram_read、trace_ram_read_write、trace_non_determinism_read、record_delegation和at_cycle_end_ext。
 
-### 12.1 SingleCycleTracingData
+### 8.1 CycleData结构
+
+SingleCycleTracingData保存一行VM原始记录，不保存field trace列号。
 
 ```rust
 // prover/src/tracers/main_cycle_optimized.rs
@@ -3745,65 +3130,42 @@ pub struct SingleCycleTracingData {
 
     pub non_determinism_read: u32,
 }
-```
 
-字段按固定三槽组织：
-
-```text
-slot0:
-  rs1_read_value
-  rs1_read_timestamp
-  rs1_reg_idx
-
-slot1:
-  rs2_or_mem_word_read_value
-  rs2_or_mem_word_address
-  rs2_or_mem_read_timestamp
-
-slot2:
-  rd_or_mem_word_read_value
-  rd_or_mem_word_write_value
-  rd_or_mem_word_address
-  rd_or_mem_read_timestamp
-
-cycle级字段:
-  pc
-  delegation_request
-  non_determinism_read
-```
-
-slot1用rs2_or_mem命名，因为LOAD把slot1改成RAM read。slot2用rd_or_mem命名，因为STORE把slot2改成RAM write。
-
-### 12.2 CycleData
-
-```rust
-// prover/src/tracers/main_cycle_optimized.rs
 pub struct CycleData<C: MachineConfig, A: GoodAllocator = Global> {
     pub cycles_traced: usize,
     pub per_cycle_data: Vec<SingleCycleTracingData, A>,
     pub num_cycles_chunk_size: usize,
     _marker: std::marker::PhantomData<C>,
 }
+```
 
-impl<C: MachineConfig, A: GoodAllocator> CycleData<C, A> {
-    pub fn new_with_cycles_capacity(num_cycles: usize) -> Self {
-        let capacity = num_cycles + 1;
-        assert!(capacity.is_power_of_two());
-        Self {
-            cycles_traced: 0,
-            per_cycle_data: Vec::with_capacity_in(capacity, A::default()),
-            num_cycles_chunk_size: num_cycles,
-            _marker: std::marker::PhantomData,
-        }
+字段按main circuit的3个shuffle RAM access组织：
+
+1. slot0：rs1 register read。字段是rs1_read_value、rs1_read_timestamp、rs1_reg_idx。
+2. slot1：rs2 register read或RAM load。字段是rs2_or_mem_word_read_value、rs2_or_mem_word_address、rs2_or_mem_read_timestamp。
+3. slot2：rd register write或RAM store。字段是rd_or_mem_word_read_value、rd_or_mem_word_write_value、rd_or_mem_word_address、rd_or_mem_read_timestamp。
+
+pc用于RomRead和state linkage。non_determinism_read用于ExternalOracle。delegation_request用于CSR delegation request。
+
+CycleData::new_with_cycles_capacity要求capacity = num_cycles + 1是2的幂。num_cycles等于trace_len - 1，所以capacity等于trace_len。
+
+```rust
+// prover/src/tracers/main_cycle_optimized.rs
+pub fn new_with_cycles_capacity(num_cycles: usize) -> Self {
+    let capacity = num_cycles + 1;
+    assert!(capacity.is_power_of_two());
+    Self {
+        cycles_traced: 0,
+        per_cycle_data: Vec::with_capacity_in(capacity, A::default()),
+        num_cycles_chunk_size: num_cycles,
+        _marker: std::marker::PhantomData,
     }
 }
 ```
 
-num_cycles_chunk_size等于trace_len - 1。per_cycle_data最终长度等于num_cycles_chunk_size。capacity额外加1，是为了和trace_len对齐。
+### 8.2 RegIndexOrMemWordIndex
 
-### 12.3 RegIndexOrMemWordIndex
-
-slot1和slot2需要同时表示register和RAM地址。RegIndexOrMemWordIndex用最高位标记RAM。
+slot1和slot2可以表示寄存器，也可以表示RAM word。RegIndexOrMemWordIndex用最高位区分两类地址。
 
 ```rust
 // prover/src/tracers/main_cycle_optimized.rs
@@ -3835,21 +3197,25 @@ impl RegIndexOrMemWordIndex {
 }
 ```
 
+register(index)保存寄存器编号。memory(absolute_address)保存word index并设置最高位。as_u32_formal_address对RAM地址会左移2位，恢复字节地址；对register地址返回寄存器编号。
+
 ```text
 register x5:
   raw = 5
   is_register == true
   as_u32_formal_address == 5
 
-RAM address 0x1000:
+RAM byte address 0x1000:
   raw = (0x1000 >> 2) | 0x80000000
   is_register == false
   as_u32_formal_address == 0x1000
 ```
 
-### 12.4 RamTracingData
+memory witness写RegisterOrRam access时，同时写is_register和address。is_register告诉memory argument这条record属于register地址空间还是RAM地址空间。
 
-RamTracingData保存每个寄存器和每个RAM word最后一次被写的timestamp。每次访问时，tracer读取旧timestamp作为read_timestamp，再把当前write_timestamp写回。
+### 8.3 RAM/register last timestamp
+
+RamTracingData保存每个寄存器和每个RAM word的上一次写timestamp。每次访问会返回read_timestamp，并把当前write_timestamp写回。
 
 ```rust
 // prover/src/tracers/main_cycle_optimized.rs
@@ -3889,162 +3255,11 @@ pub(crate) fn mark_ram_slot_use(
 }
 ```
 
-register_last_live_timestamps初始全0。某个寄存器第一次访问时，read_timestamp为0。访问后，该寄存器最后timestamp变成当前slot的write_timestamp。
+read_timestamp是本次访问读到的旧版本timestamp。write_timestamp是本次访问产生的新版本timestamp。后续memory argument会用read_record和write_record证明同一地址的版本链一致。witness生成阶段只写record和辅助变量，不展开memory grand product。
 
-RAM访问还会更新access_bitmask。VM结束后，run_till_end_for_gpu_for_machine_config遍历access_bitmask生成RAM teardown数据。
+### 8.4 tracer回调写CycleData
 
-### 12.5 tracer生命周期
-
-GPUFriendlyTracer::new创建当前chunk的CycleData。
-
-```rust
-pub fn new(
-    initial_timestamp: TimestampScalar,
-    bookkeeping_aux_data: RamTracingData<TRACE_FOR_TEARDOWNS>,
-    delegation_tracer: DelegationTracingData<A>,
-    chunk_size: usize,
-    max_num_chunks: usize,
-) -> Self {
-    assert!((chunk_size + 1).is_power_of_two());
-
-    let trace_chunk = CycleData::<C, A>::new_with_cycles_capacity(chunk_size);
-
-    Self {
-        bookkeeping_aux_data,
-        trace_chunk,
-        traced_chunks: Vec::with_capacity(max_num_chunks),
-        delegation_tracer,
-        chunk_size,
-        current_timestamp: initial_timestamp,
-    }
-}
-```
-
-prepare_for_next_chunk把当前trace_chunk移入traced_chunks，并创建新CycleData。
-
-```rust
-pub fn prepare_for_next_chunk(&mut self, timestamp: TimestampScalar) {
-    self.trace_chunk.assert_at_capacity();
-    let processed = std::mem::replace(
-        &mut self.trace_chunk,
-        CycleData::<C, A>::new_with_cycles_capacity(self.chunk_size),
-    );
-    self.traced_chunks.push(processed);
-    self.current_timestamp = timestamp;
-}
-```
-
-## 13. timestamp体系
-
-文件：cs/src/definitions/mod.rs、cs/src/definitions/constants.rs
-
-VM和memory argument使用TimestampScalar表示访问顺序。每个cycle内部最多使用4个slot，main RISC-V实际使用0、1、2三个slot，delegation使用3。
-
-```rust
-// cs/src/definitions/mod.rs
-pub const INITIAL_TIMESTAMP_AT_CHUNK_START: TimestampScalar = 4;
-pub const TIMESTAMP_STEP: TimestampScalar = 1 << NUM_EMPTY_BITS_FOR_RAM_TIMESTAMP;
-
-pub const fn timestamp_from_chunk_cycle_and_sequence(
-    cycle_in_chunk: usize,
-    chunk_capacity: usize,
-    circuit_sequence: usize,
-) -> TimestampScalar {
-    let trace_len = chunk_capacity + 1;
-
-    INITIAL_TIMESTAMP_AT_CHUNK_START
-        + TIMESTAMP_STEP * (cycle_in_chunk as TimestampScalar)
-        + timestamp_high_contribution_from_circuit_sequence(circuit_sequence, trace_len)
-}
-```
-
-NUM_EMPTY_BITS_FOR_RAM_TIMESTAMP等于2，因此TIMESTAMP_STEP等于4。
-
-```text
-base timestamp for row k = 4 + 4 * k + chunk_high_contribution
-slot0 timestamp = base + 0
-slot1 timestamp = base + 1
-slot2 timestamp = base + 2
-delegation timestamp = base + 3
-```
-
-GPUFriendlyTracer在每个cycle末尾执行：
-
-```rust
-fn at_cycle_end_ext(&mut self, _current_state: &state_new::RiscV32StateForUnrolledProver<C>) {
-    self.current_timestamp += TIMESTAMP_STEP;
-    self.trace_chunk.cycles_traced += 1;
-}
-```
-
-### 13.1 slot编号
-
-```rust
-// prover/src/tracers/main_cycle_optimized.rs
-const RS1_ACCESS_IDX: TimestampScalar = 0;
-const RS2_ACCESS_IDX: TimestampScalar = 1;
-const RD_ACCESS_IDX: TimestampScalar = 2;
-const DELEGATION_ACCESS_IDX: TimestampScalar = 3;
-
-const RAM_READ_ACCESS_IDX: TimestampScalar = RS2_ACCESS_IDX;
-const RAM_WRITE_ACCESS_IDX: TimestampScalar = RD_ACCESS_IDX;
-```
-
-slot编号和CycleData字段关系：
-
-```text
-slot0 / RS1_ACCESS_IDX:
-  trace_rs1_read
-  rs1_read_timestamp
-
-slot1 / RS2_ACCESS_IDX / RAM_READ_ACCESS_IDX:
-  trace_rs2_read or trace_ram_read
-  rs2_or_mem_read_timestamp
-
-slot2 / RD_ACCESS_IDX / RAM_WRITE_ACCESS_IDX:
-  trace_rd_write or trace_ram_read_write
-  rd_or_mem_read_timestamp
-```
-
-> [!TIP]
->
-> 第0行base timestamp是4。slot0写timestamp是4，slot1是5，slot2是6。第1行base timestamp是8，slot0是8，slot1是9，slot2是10。两个cycle之间留出低2位，用来记录cycle内访问顺序。
-
-### 13.2 TimestampData
-
-TimestampData用3个u16保存TimestampScalar，便于tracer紧凑存储。后续witness写memory columns时会把TimestampScalar拆成两个TIMESTAMP_COLUMNS_NUM_BITS宽度的列。
-
-```rust
-// cs/src/definitions/mod.rs
-pub const NUM_TIMESTAMP_DATA_LIMBS: usize = 3;
-pub type TimestampScalar = u64;
-
-#[repr(C)]
-pub struct TimestampData(pub [u16; NUM_TIMESTAMP_DATA_LIMBS]);
-
-impl TimestampData {
-    pub const fn from_scalar(ts: TimestampScalar) -> Self {
-        let l0 = ts as u16;
-        let l1 = (ts >> 16) as u16;
-        let l2 = (ts >> 32) as u16;
-        Self([l0, l1, l2])
-    }
-
-    pub const fn as_scalar(&self) -> TimestampScalar {
-        (self.0[0] as u64) | ((self.0[1] as u64) << 16) | ((self.0[2] as u64) << 32)
-    }
-}
-```
-
-TimestampData属于VM记录格式。witness阶段会把它转成field元素列。
-
-## 14. GPUFriendlyTracer回调
-
-GPUFriendlyTracer把VM事件写入当前CycleData的最后一行。
-
-### 14.1 cycle开始和结束
-
-at_cycle_start_ext追加空行并写pc。
+at_cycle_start_ext为当前cycle追加一条EMPTY_SINGLE_CYCLE_TRACING_DATA，并写pc。
 
 ```rust
 // prover/src/tracers/main_cycle_optimized.rs
@@ -4063,18 +3278,10 @@ fn at_cycle_start_ext(&mut self, current_state: &state_new::RiscV32StateForUnrol
 }
 ```
 
-at_cycle_end_ext推进timestamp和计数器。
+trace_rs1_read写slot0。它读取寄存器上一次timestamp，生成slot0当前write timestamp，并记录读值和寄存器编号。
 
 ```rust
-fn at_cycle_end_ext(&mut self, _current_state: &state_new::RiscV32StateForUnrolledProver<C>) {
-    self.current_timestamp += TIMESTAMP_STEP;
-    self.trace_chunk.cycles_traced += 1;
-}
-```
-
-### 14.2 trace_rs1_read
-
-```rust
+// prover/src/tracers/main_cycle_optimized.rs
 fn trace_rs1_read(&mut self, reg_idx: u32, read_value: u32) {
     let write_timestamp = self.current_timestamp + RS1_ACCESS_IDX;
     let read_timestamp = self
@@ -4088,11 +3295,10 @@ fn trace_rs1_read(&mut self, reg_idx: u32, read_value: u32) {
 }
 ```
 
-trace_rs1_read固定写slot0。它把当前寄存器旧timestamp作为read_timestamp，并把寄存器最后timestamp更新成base + 0。
-
-### 14.3 trace_rs2_read
+trace_rs2_read写slot1为register read。LoadOp执行时，trace_ram_read会覆盖同一组rs2_or_mem字段，把slot1改成RAM read。
 
 ```rust
+// prover/src/tracers/main_cycle_optimized.rs
 fn trace_rs2_read(&mut self, reg_idx: u32, read_value: u32) {
     let write_timestamp = self.current_timestamp + RS2_ACCESS_IDX;
     let read_timestamp = self
@@ -4106,11 +3312,10 @@ fn trace_rs2_read(&mut self, reg_idx: u32, read_value: u32) {
 }
 ```
 
-trace_rs2_read固定写slot1为register read。LOAD路径不调用它，因为LOAD要把slot1用于RAM read。
-
-### 14.4 trace_rd_write
+trace_rd_write写slot2为register write。rd为x0时，written_value被强制改成0。
 
 ```rust
+// prover/src/tracers/main_cycle_optimized.rs
 fn trace_rd_write(&mut self, reg_idx: u32, read_value: u32, written_value: u32) {
     let write_timestamp = self.current_timestamp + RD_ACCESS_IDX;
     let read_timestamp = self
@@ -4118,7 +3323,6 @@ fn trace_rd_write(&mut self, reg_idx: u32, read_value: u32, written_value: u32) 
         .mark_register_use(reg_idx, write_timestamp);
 
     let dst = self.trace_chunk.per_cycle_data.last_mut().unwrap_unchecked();
-
     let mut written_value = written_value;
     if reg_idx == 0 {
         assert_eq!(read_value, 0);
@@ -4132,15 +3336,11 @@ fn trace_rd_write(&mut self, reg_idx: u32, read_value: u32, written_value: u32) 
 }
 ```
 
-trace_rd_write固定写slot2为register write。写x0时，written_value被清零。
-
-### 14.5 trace_ram_read
+trace_ram_read把slot1改成RAM read。trace_ram_read_write把slot2改成RAM write。
 
 ```rust
+// prover/src/tracers/main_cycle_optimized.rs
 fn trace_ram_read(&mut self, phys_address: u64, read_value: u32) {
-    assert!(phys_address < (1u64 << 32));
-    assert_eq!(phys_address % 4, 0);
-
     let (address, read_value) = if phys_address < self.bookkeeping_aux_data.rom_bound as u64 {
         (0, 0)
     } else {
@@ -4148,33 +3348,23 @@ fn trace_ram_read(&mut self, phys_address: u64, read_value: u32) {
     };
 
     let write_timestamp = self.current_timestamp + RAM_READ_ACCESS_IDX;
-    let phys_word_idx = address / 4;
     let read_timestamp = self
         .bookkeeping_aux_data
-        .mark_ram_slot_use(phys_word_idx as u32, write_timestamp);
+        .mark_ram_slot_use((address / 4) as u32, write_timestamp);
 
     let dst = self.trace_chunk.per_cycle_data.last_mut().unwrap_unchecked();
     dst.rs2_or_mem_word_read_value = read_value;
     dst.rs2_or_mem_word_address = RegIndexOrMemWordIndex::memory(address as u32);
     dst.rs2_or_mem_read_timestamp = TimestampData::from_scalar(read_timestamp);
 }
-```
 
-trace_ram_read写slot1为RAM read。ROM范围内的RAM read被替换成address=0、read_value=0。
-
-### 14.6 trace_ram_read_write
-
-```rust
 fn trace_ram_read_write(&mut self, phys_address: u64, read_value: u32, written_value: u32) {
-    assert!(phys_address < (1u64 << 32));
-    assert_eq!(phys_address % 4, 0);
     assert!(phys_address >= self.bookkeeping_aux_data.rom_bound as u64, "Cannot write to ROM");
 
     let write_timestamp = self.current_timestamp + RAM_WRITE_ACCESS_IDX;
-    let phys_word_idx = phys_address / 4;
     let read_timestamp = self
         .bookkeeping_aux_data
-        .mark_ram_slot_use(phys_word_idx as u32, write_timestamp);
+        .mark_ram_slot_use((phys_address / 4) as u32, write_timestamp);
 
     let dst = self.trace_chunk.per_cycle_data.last_mut().unwrap_unchecked();
     dst.rd_or_mem_word_read_value = read_value;
@@ -4184,22 +3374,25 @@ fn trace_ram_read_write(&mut self, phys_address: u64, read_value: u32, written_v
 }
 ```
 
-trace_ram_read_write写slot2为RAM write。它记录旧aligned word和新aligned word。
-
-### 14.7 non-determinism和delegation
-
-trace_non_determinism_read写non_determinism_read。
+at_cycle_end_ext推进current_timestamp并增加cycles_traced。
 
 ```rust
-fn trace_non_determinism_read(&mut self, read_value: u32) {
-    let dst = self.trace_chunk.per_cycle_data.last_mut().unwrap_unchecked();
-    dst.non_determinism_read = read_value;
+fn at_cycle_end_ext(&mut self, _current_state: &state_new::RiscV32StateForUnrolledProver<C>) {
+    self.current_timestamp += TIMESTAMP_STEP;
+    self.trace_chunk.cycles_traced += 1;
 }
 ```
 
-record_delegation写delegation_request，并更新delegation访问的register/RAM timestamp。
+> [!TIP]
+>
+> ADD x3, x1, x2通常触发slot0=read x1、slot1=read x2、slot2=write x3。LOAD x3, 0(x1)触发slot0=read x1、slot1=RAM read、slot2=write x3。STORE x2, 0(x1)触发slot0=read x1、slot1=read x2、slot2=RAM write。
+
+### 8.5 delegation记录边界
+
+record_delegation在main tracer里出现，但delegation circuit内部不在本章展开。main RISC-V只记录当前cycle发出了哪类delegation request，并更新被delegation访问的register/RAM timestamp。
 
 ```rust
+// prover/src/tracers/main_cycle_optimized.rs
 fn record_delegation(
     &mut self,
     access_id: u32,
@@ -4217,263 +3410,1506 @@ fn record_delegation(
         dst.delegation_request = access_id as u16;
     }
 
-    // 省略delegation witness日志和timestamp更新...
+    // 省略register和RAM timestamp bookkeeping...
 }
 ```
 
-main RISC-V VM只记录delegation request和被访问内存的timestamp。delegation circuit内部执行记录由DelegationWitness保存。
+main witness会把delegation_request写入memory subtree的delegation_request_layout。delegation circuit的专用witness生成由DelegationCircuitOracle处理，本章只说明main RISC-V侧的request字段。
 
-## 15. VM事件路径
+## 9. MainRiscVOracle
 
-### 15.1 ADD
+文件：prover/src/tracers/oracles/main_risc_v_circuit.rs
 
-ADD属于OP路径。cycle前半段读取rs1和rs2，OP分支计算rd_value，再写rd。
+MainRiscVOracle实现Oracle<Mersenne31Field>。generated witness function通过SimpleWitnessProxy调用get_oracle_value_u32、get_oracle_value_u16、get_oracle_value_boolean和get_timestamp_witness_from_placeholder。proxy把调用转发给MainRiscVOracle，oracle读取CycleData.per_cycle_data[trace_step]。
 
-```text
-cycle start:
-  at_cycle_start_ext -> pc
+### 9.1 Placeholder来源
 
-common decode:
-  opcode = opcode_read(pc)
-  pc = pc + 4
-  rs1_value = x[rs1]
-  trace_rs1_read(rs1, rs1_value)
-  rs2_value = x[rs2]
-  trace_rs2_read(rs2, rs2_value)
+Placeholder定义在cs/src/cs/placeholder.rs。setup/compile阶段Machine::describe_state_transition用Placeholder创建变量，compile_inner把这些变量分配列，generated witness function再用相同Placeholder向oracle取真实值。
 
-OP ADD:
-  rd_value = rs1_value + rs2_value mod 2^32
-  rd_old_value = set_register(rd, rd_value)
-  trace_rd_write(rd, rd_old_value, rd_value)
-
-cycle end:
-  at_cycle_end_ext
+```rust
+// cs/src/cs/placeholder.rs
+pub enum Placeholder {
+    PcInit,
+    ExternalOracle,
+    FirstRegMem,
+    SecondRegMem,
+    MemSlot,
+    WriteRdReadSetWitness,
+    ShuffleRamAddress(usize),
+    ShuffleRamReadTimestamp(usize),
+    ShuffleRamReadValue(usize),
+    ShuffleRamIsRegisterAccess(usize),
+    ShuffleRamWriteValue(usize),
+    ExecuteDelegation,
+    DelegationType,
+    DegelationABIOffset,
+    // 省略delegation circuit专用placeholder...
+}
 ```
 
-CycleData字段：
+Placeholder是约束构造和witness生成之间的名字约定，不保存列号。
 
 ```text
-pc = old pc
-rs1_read_value = x[rs1] before ADD
-rs1_reg_idx = rs1
-rs2_or_mem_word_read_value = x[rs2] before ADD
-rs2_or_mem_word_address = register(rs2)
-rd_or_mem_word_read_value = old x[rd]
-rd_or_mem_word_write_value = rd_value
-rd_or_mem_word_address = register(rd)
+describe_state_transition:
+  Placeholder::PcInit -> 创建Variable
+
+compile_inner:
+  Variable -> ColumnAddress
+
+generated witness:
+  Placeholder::PcInit -> oracle读取cycle_data.pc
+  ColumnAddress对应的列 -> 写入pc_low/pc_high
 ```
 
-### 15.2 LOAD
+### 9.2 u32 placeholder
 
-LOAD不读取formal rs2。slot1用于RAM read。
-
-```text
-cycle start:
-  at_cycle_start_ext -> pc
-
-common decode:
-  pc = pc + 4
-  rs1_value = x[rs1]
-  trace_rs1_read(rs1, rs1_value)
-  rs2_value = 0
-
-LOAD:
-  load_address = rs1_value + sign_extend(imm12)
-  (aligned_word, selected_value) = mem_read(load_address, num_bytes)
-  trace_ram_read(load_address & !0x3, aligned_word)
-  rd_value = sign_or_zero_extend(selected_value)
-  rd_old_value = set_register(rd, rd_value)
-  trace_rd_write(rd, rd_old_value, rd_value)
-```
-
-CycleData字段：
-
-```text
-slot0:
-  rs1 register read
-
-slot1:
-  rs2_or_mem_word_address = memory(aligned address)
-  rs2_or_mem_word_read_value = aligned RAM word
-  rs2_or_mem_read_timestamp = previous timestamp of RAM word
-
-slot2:
-  rd_or_mem_word_address = register(rd)
-  rd_or_mem_word_read_value = old x[rd]
-  rd_or_mem_word_write_value = loaded rd value
-```
-
-### 15.3 STORE
-
-STORE读取rs1和rs2，slot2用于RAM write。
-
-```text
-cycle start:
-  at_cycle_start_ext -> pc
-
-common decode:
-  pc = pc + 4
-  rs1_value = x[rs1]
-  trace_rs1_read(rs1, rs1_value)
-  rs2_value = x[rs2]
-  trace_rs2_read(rs2, rs2_value)
-
-STORE:
-  store_address = rs1_value + sign_extend(imm12)
-  (old_word, new_word) = mem_write(store_address, rs2_value, store_length)
-  trace_ram_read_write(store_address & !0x3, old_word, new_word)
-```
-
-CycleData字段：
-
-```text
-slot0:
-  rs1 register read
-
-slot1:
-  rs2 register read
-
-slot2:
-  rd_or_mem_word_address = memory(aligned address)
-  rd_or_mem_word_read_value = old aligned RAM word
-  rd_or_mem_word_write_value = new aligned RAM word
-  rd_or_mem_read_timestamp = previous timestamp of RAM word
-```
-
-STORE不会调用trace_rd_write。rd_or_mem字段由trace_ram_read_write写入。
-
-### 15.4 BRANCH
-
-BRANCH读取rs1和rs2，可能修改pc。slot2被记录成x0写0。
-
-```text
-BRANCH:
-  should_jump = compare(rs1_value, rs2_value, funct3)
-  if should_jump:
-    pc = pc_start + sign_extend(branch_imm)
-  else:
-    pc = pc_start + 4
-
-  rd = 0
-  rd_old_value = x0
-  trace_rd_write(0, rd_old_value, 0)
-```
-
-BRANCH保持三槽记录：slot0读rs1，slot1读rs2，slot2写x0。后续约束会用B-format flag处理slot2为空写入。
-
-### 15.5 CSR和delegation
-
-CSR路径根据csr_number分三类：NON_DETERMINISM_CSR、MARKER_CSR、delegation CSR。
-
-```text
-NON_DETERMINISM_CSR:
-  rd_value = non_determinism_source.read()
-  trace_non_determinism_read(rd_value)
-  non_determinism_source.write_with_memory_access(memory, rs1_value)
-  trace_non_determinism_write(rs1_value)
-  trace_rd_write(rd, old rd, rd_value)
-
-MARKER_CSR:
-  add_marker()
-  trace_rd_write(rd, old rd, 0)
-
-delegation CSR:
-  csr_processor.process_write(..., tracer)
-  tracer.record_delegation(...)
-  trace_rd_write(rd, old rd, 0)
-```
-
-CycleData字段：
-
-```text
-non_determinism_read:
-  NON_DETERMINISM_CSR read result
-
-delegation_request:
-  delegation CSR id
-
-slot2:
-  rd write record，delegation CSR返回0
-```
-
-## 16. VM输出和witness边界
-
-VM阶段到这里结束。它输出CycleData、FinalRegisterValue和RAM teardown data。
-
-witness阶段的最小边界如下：
-
-```text
-CycleData
-  -> MainRiscVOracle
-  -> evaluate_witness
-```
-
-MainRiscVOracle读取CycleData字段：
+MainRiscVOracle的u32入口读取pc、寄存器值、RAM值和external oracle。
 
 ```rust
 // prover/src/tracers/oracles/main_risc_v_circuit.rs
-Placeholder::PcInit => cycle_data.pc,
-Placeholder::FirstRegMem => cycle_data.rs1_read_value,
-Placeholder::SecondRegMem => cycle_data.rs2_or_mem_word_read_value,
-Placeholder::WriteRdReadSetWitness => cycle_data.rd_or_mem_word_read_value,
-Placeholder::ExternalOracle => cycle_data.non_determinism_read,
+fn get_u32_witness_from_placeholder(&self, placeholder: Placeholder, trace_step: usize) -> u32 {
+    let cycle_data = &self.cycle_data.per_cycle_data[trace_step];
+
+    match placeholder {
+        Placeholder::PcInit => cycle_data.pc,
+        Placeholder::FirstRegMem => cycle_data.rs1_read_value,
+        Placeholder::SecondRegMem => cycle_data.rs2_or_mem_word_read_value,
+        Placeholder::WriteRdReadSetWitness => cycle_data.rd_or_mem_word_read_value,
+
+        Placeholder::MemSlot => {
+            let rs2_or_mem_address = cycle_data.rs2_or_mem_word_address;
+            let rd_or_mem_address = cycle_data.rd_or_mem_word_address;
+            if rs2_or_mem_address.is_register() == false && rd_or_mem_address.is_register() {
+                cycle_data.rs2_or_mem_word_read_value
+            } else if rs2_or_mem_address.is_register()
+                && rd_or_mem_address.is_register() == false
+            {
+                cycle_data.rd_or_mem_word_read_value
+            } else {
+                0
+            }
+        }
+
+        Placeholder::ShuffleRamAddress(access_idx) => match access_idx {
+            1 => cycle_data.rs2_or_mem_word_address.as_u32_formal_address(),
+            2 => cycle_data.rd_or_mem_word_address.as_u32_formal_address(),
+            _ => unreachable!(),
+        },
+
+        Placeholder::ShuffleRamReadValue(access_idx) => match access_idx {
+            0 => cycle_data.rs1_read_value,
+            1 => cycle_data.rs2_or_mem_word_read_value,
+            2 => cycle_data.rd_or_mem_word_read_value,
+            _ => unreachable!(),
+        },
+
+        Placeholder::ShuffleRamWriteValue(access_idx) => match access_idx {
+            0 => cycle_data.rs1_read_value,
+            1 => cycle_data.rs2_or_mem_word_read_value,
+            2 => cycle_data.rd_or_mem_word_write_value,
+            _ => unreachable!(),
+        },
+
+        Placeholder::ExternalOracle => cycle_data.non_determinism_read,
+        a @ _ => panic!("placeholder {:?} is not supported as u32 query", a),
+    }
+}
 ```
 
-shuffle RAM相关placeholder读取三槽字段：
-
-```rust
-Placeholder::ShuffleRamAddress(access_idx)
-Placeholder::ShuffleRamReadTimestamp(access_idx)
-Placeholder::ShuffleRamReadValue(access_idx)
-Placeholder::ShuffleRamIsRegisterAccess(access_idx)
-Placeholder::ShuffleRamWriteValue(access_idx)
-```
-
-本版笔记不展开witness如何写列、如何统计lookup multiplicity、如何生成stage2 trace。保留版airbender-main-riscv-setup-vm-witness-full.md包含这些内容。
-
-## 17. VM源码阅读路线
-
-VM源码阅读顺序：
-
-1. circuit_defs/trace_and_split/src/lib.rs
-   run_till_end_for_gpu_for_machine_config创建memory、state、tracer，并按chunk调用run_cycles。
-
-2. prover/src/tracer.rs
-   VectorMemoryImplWithRom定义ROM/RAM边界、populate、get、set、get_final_ram_state。
-
-3. risc_v_simulator/src/cycle/state_new.rs
-   RiscV32StateForUnrolledProver::initial创建pc和registers；run_cycles循环调用cycle；cycle执行一条指令。
-
-4. risc_v_simulator/src/abstractions/tracer.rs
-   Tracer<C>定义VM事件接口。
-
-5. prover/src/tracers/main_cycle_optimized.rs
-   GPUFriendlyTracer实现Tracer<C>，写CycleData并维护timestamp bookkeeping。
-
-6. cs/src/definitions/mod.rs
-   timestamp_from_chunk_cycle_and_sequence定义chunk/cycle/slot timestamp。
-
-7. prover/src/tracers/oracles/main_risc_v_circuit.rs
-   MainRiscVOracle说明CycleData后续如何进入witness。
-
-最短字段追踪路径：
+MemSlot根据slot1和slot2的地址类型判断load/store：
 
 ```text
-pc:
-  RiscV32StateForUnrolledProver.observable.pc
-  -> GPUFriendlyTracer::at_cycle_start_ext
-  -> SingleCycleTracingData.pc
-  -> MainRiscVOracle::Placeholder::PcInit
+LOAD:
+  rs2_or_mem_address.is_register == false
+  rd_or_mem_address.is_register == true
+  MemSlot = rs2_or_mem_word_read_value
 
-LOAD RAM word:
-  mem_read(load_address)
-  -> GPUFriendlyTracer::trace_ram_read
-  -> rs2_or_mem_word_read_value / address / read_timestamp
-  -> MainRiscVOracle::ShuffleRam*(1)
+STORE:
+  rs2_or_mem_address.is_register == true
+  rd_or_mem_address.is_register == false
+  MemSlot = rd_or_mem_word_read_value
 
-STORE RAM word:
-  mem_write(store_address)
-  -> GPUFriendlyTracer::trace_ram_read_write
-  -> rd_or_mem_word_read_value / write_value / address / read_timestamp
-  -> MainRiscVOracle::ShuffleRam*(2)
+普通register指令:
+  MemSlot = 0
 ```
+
+### 9.3 u16、boolean和timestamp placeholder
+
+u16入口处理delegation字段和shuffle RAM地址低16位。
+
+```rust
+// prover/src/tracers/oracles/main_risc_v_circuit.rs
+fn get_u16_witness_from_placeholder(&self, placeholder: Placeholder, trace_step: usize) -> u16 {
+    let cycle_data = &self.cycle_data.per_cycle_data[trace_step];
+
+    match placeholder {
+        Placeholder::DegelationABIOffset => 0,
+        Placeholder::DelegationType => cycle_data.delegation_request,
+
+        Placeholder::ShuffleRamAddress(access_idx) => match access_idx {
+            0 => cycle_data.rs1_reg_idx as u16,
+            1 => cycle_data.rs2_or_mem_word_address.as_u32_formal_address() as u16,
+            2 => cycle_data.rd_or_mem_word_address.as_u32_formal_address() as u16,
+            _ => unreachable!(),
+        },
+        Placeholder::ExecuteDelegation => (cycle_data.delegation_request != 0) as u16,
+        a @ _ => panic!("placeholder {:?} is not supported as u16 query", a),
+    }
+}
+```
+
+boolean入口处理is_register和ExecuteDelegation。
+
+```rust
+fn get_boolean_witness_from_placeholder(
+    &self,
+    placeholder: Placeholder,
+    trace_step: usize,
+) -> bool {
+    let cycle_data = &self.cycle_data.per_cycle_data[trace_step];
+
+    match placeholder {
+        Placeholder::ShuffleRamIsRegisterAccess(access_idx) => match access_idx {
+            0 => true,
+            1 => cycle_data.rs2_or_mem_word_address.is_register(),
+            2 => cycle_data.rd_or_mem_word_address.is_register(),
+            _ => unreachable!(),
+        },
+
+        Placeholder::ExecuteDelegation => cycle_data.delegation_request != 0,
+        a @ _ => panic!("placeholder {:?} is not supported as boolean query", a),
+    }
+}
+```
+
+timestamp入口返回每个slot的read timestamp。
+
+```rust
+fn get_timestamp_witness_from_placeholder(
+    &self,
+    placeholder: Placeholder,
+    trace_step: usize,
+) -> TimestampScalar {
+    let cycle_data = &self.cycle_data.per_cycle_data[trace_step];
+
+    match placeholder {
+        Placeholder::ShuffleRamReadTimestamp(access_idx) => match access_idx {
+            0 => cycle_data.rs1_read_timestamp.as_scalar(),
+            1 => cycle_data.rs2_or_mem_read_timestamp.as_scalar(),
+            2 => cycle_data.rd_or_mem_read_timestamp.as_scalar(),
+            _ => unreachable!(),
+        },
+        a @ _ => panic!("placeholder {:?} is not supported as timestamp scalar", a),
+    }
+}
+```
+
+MainRiscVOracle不执行lookup，不写trace，不检查约束。它只把Placeholder映射到CycleData字段。
+
+## 10. evaluate_witness
+
+文件：prover/src/witness_evaluator/new/mod.rs
+
+evaluate_witness把CompiledCircuitArtifact、TableDriver、CycleData oracle和generated witness function组合起来，生成WitnessEvaluationData。
+
+### 10.1 输入和输出
+
+```rust
+// prover/src/witness_evaluator/new/mod.rs
+pub fn evaluate_witness<O: Oracle<Mersenne31Field>, A: GoodAllocator>(
+    compiled_circuit: &CompiledCircuitArtifact<Mersenne31Field>,
+    witnes_eval_fn_ptr: fn(&mut SimpleWitnessProxy<'_, O>),
+    cycles: usize,
+    oracle: &O,
+    lazy_init_data: &[LazyInitAndTeardown],
+    table_driver: &TableDriver<Mersenne31Field>,
+    circuit_sequence: usize,
+    worker: &Worker,
+    allocator: A,
+) -> WitnessEvaluationData<DEFAULT_TRACE_PADDING_MULTIPLE, A> {
+    // 省略代码...
+}
+```
+
+输入含义：
+
+1. compiled_circuit：setup/compile阶段生成的列布局和约束描述。
+2. witnes_eval_fn_ptr：generated witness function包装入口。
+3. cycles：当前chunk真实cycle数量，main RISC-V等于trace_len - 1。
+4. oracle：MainRiscVOracle，读取CycleData。
+5. lazy_init_data：当前chunk的lazy init/teardown行数据。
+6. table_driver：固定lookup表内容。
+7. circuit_sequence：当前chunk编号，用于timestamp高位。
+8. worker、allocator：并行和内存分配。
+
+输出WitnessEvaluationData：
+
+```rust
+// prover/src/witness_evaluator/mod.rs
+pub struct WitnessEvaluationData<const N: usize, A: Allocator + Clone> {
+    pub aux_data: WitnessEvaluationAuxData,
+    pub exec_trace: RowMajorTrace<Mersenne31Field, N, A>,
+    pub num_witness_columns: usize,
+    pub lookup_mapping: RowMajorTrace<u32, N, A>,
+}
+```
+
+exec_trace每行包含witness subtree和memory subtree：
+
+```text
+exec_trace[row] =
+  witness_row[0..num_witness_columns]
+  +
+  memory_row[0..num_memory_columns]
+```
+
+lookup_mapping每行宽度等于witness_layout.width_3_lookups.len。它不保存lookup输入值，只保存每个generic lookup命中的absolute table index。
+
+### 10.2 trace分配
+
+evaluate_witness先检查cycles和trace_len关系，再分配exec_trace和lookup_mapping。
+
+```rust
+// prover/src/witness_evaluator/new/mod.rs
+let trace_len = cycles.next_power_of_two();
+assert_eq!(cycles, trace_len - 1);
+
+let num_lookup_table_encoding_tuples = compiled_circuit.witness_layout.width_3_lookups.len();
+
+let num_witness_columns = compiled_circuit.witness_layout.total_width;
+let num_memory_columns = compiled_circuit.memory_layout.total_width;
+
+let mut exec_trace = RowMajorTrace::<Mersenne31Field, DEFAULT_TRACE_PADDING_MULTIPLE, _>
+    ::new_zeroed_for_size_parallel(
+        trace_len,
+        num_witness_columns + num_memory_columns,
+        allocator.clone(),
+        worker,
+    );
+
+let lookup_mapping =
+    RowMajorTrace::<u32, DEFAULT_TRACE_PADDING_MULTIPLE, _>::new_zeroed_for_size_parallel(
+        trace_len,
+        num_lookup_table_encoding_tuples,
+        allocator.clone(),
+        worker,
+    );
+```
+
+exec_trace初始全零。generated witness和static memory work只写前cycles行。最后一行保留为零，后续adjust_to_zero_c0_var_length和prover stages会处理trace承诺前的形状。
+
+evaluate_witness还检查TableDriver大小和compiled_circuit.total_tables_size一致。
+
+```rust
+assert_eq!(
+    table_driver.total_tables_len,
+    compiled_circuit.total_tables_size,
+    "table size diverged between compilation and evaluation..."
+);
+```
+
+这条检查对应setup章节的两条TableDriver路径一致性：compile_inner看到的CircuitOutput.table_driver和witness阶段使用的独立table_driver必须有相同固定表合并长度。
+
+### 10.3 每行执行顺序
+
+evaluate_witness按worker线程切分行范围。每个线程创建三类本地multiplicity counter：
+
+```rust
+let mut range_check_16_multiplicities = vec![0u32; 1 << 16];
+let mut timestamp_range_check_multiplicities =
+    vec![0u32; 1 << TIMESTAMP_COLUMNS_NUM_BITS];
+let mut generic_lookup_multiplicities =
+    vec![0u32; generic_lookup_multiplicities_total_len];
+```
+
+每行在evaluate_witness_inner中执行：
+
+```rust
+// prover/src/witness_evaluator/new/mod.rs
+for absolute_row_idx in range {
+    let is_last_cycle = absolute_row_idx == cycles - 1;
+
+    let (witness_row, memory_row) = exec_trace_view.current_row_split(num_witness_columns);
+    let lookup_mapping_row = lookup_mapping_view.current_row();
+
+    evaluate_witness_inner_static_work(
+        witness_row,
+        memory_row,
+        compiled_circuit,
+        oracle,
+        absolute_row_idx,
+        is_last_cycle,
+        lazy_init_data,
+        timestamp_high_from_circuit_sequence,
+    );
+
+    scratch_space.clear();
+    scratch_space.resize(scratch_space_size, Mersenne31Field::ZERO);
+
+    let mut proxy = SimpleWitnessProxy {
+        witness_row,
+        memory_row,
+        scratch_space: &mut scratch_space,
+        table_driver,
+        multiplicity_counting_scratch: generic_lookup_multiplicieties,
+        lookup_mapping_row,
+        oracle,
+        absolute_row_idx,
+    };
+
+    (witnes_eval_fn_ptr)(&mut proxy);
+
+    count_special_range_check_multiplicities(
+        witness_row,
+        memory_row,
+        &setup_row,
+        compiled_circuit,
+        absolute_row_idx,
+        range_check_16_multiplicieties,
+        timestamp_range_check_multiplicieties,
+        timestamp_high_contribution_if_shuffle_ram,
+        trace_len,
+    );
+
+    exec_trace_view.advance_row();
+    lookup_mapping_view.advance_row();
+}
+```
+
+每一行的写入顺序固定：
+
+1. current_row_split把exec_trace当前行拆成witness_row和memory_row。
+2. evaluate_witness_inner_static_work写memory subtree和memory相关辅助witness。
+3. scratch_space清零。
+4. SimpleWitnessProxy绑定当前行、TableDriver、Oracle和multiplicity counter。
+5. generated witness function写普通witness columns、执行fixed lookup、写lookup_mapping。
+6. count_special_range_check_multiplicities计算RangeCheck16和TimestampRangeCheck multiplicity。
+7. row view推进到下一行。
+
+static memory work先于generated evaluator。原因是generated evaluator可能读取memory columns或依赖shuffle RAM占位值，而memory subtree的地址、timestamp、read/write value需要先写入当前行。
+
+### 10.4 aux_data
+
+evaluate_witness生成exec_trace和lookup_mapping后，还会读取public input和lazy init/teardown边界值，写入WitnessEvaluationAuxData。
+
+```rust
+// prover/src/witness_evaluator/new/mod.rs
+let mut first_row_public_inputs = vec![];
+let mut one_before_last_row_public_inputs = vec![];
+
+for (location, column_address) in compiled_circuit.public_inputs.iter() {
+    match location {
+        BoundaryConstraintLocation::FirstRow => {
+            let t = exec_trace.row_view(0..1);
+            let r = &t.current_row_ref()[..num_witness_columns];
+            let value = read_value(*column_address, r, &[]);
+            first_row_public_inputs.push(value);
+        }
+        BoundaryConstraintLocation::OneBeforeLastRow => {
+            let t = exec_trace.row_view(cycles - 1..cycles);
+            let r = &t.current_row_ref()[..num_witness_columns];
+            let value = read_value(*column_address, r, &[]);
+            one_before_last_row_public_inputs.push(value);
+        }
+        BoundaryConstraintLocation::LastRow => {
+            panic!("public inputs on the last row are not supported");
+        }
+    }
+}
+
+let aux_data = WitnessEvaluationAuxData {
+    first_row_public_inputs,
+    one_before_last_row_public_inputs,
+    lazy_init_first_row: first_row.0,
+    teardown_value_first_row: first_row.1,
+    teardown_timestamp_first_row: first_row.2,
+    lazy_init_one_before_last_row: one_before_last_row.0,
+    teardown_value_one_before_last_row: one_before_last_row.1,
+    teardown_timestamp_one_before_last_row: one_before_last_row.2,
+};
+```
+
+public input来自compile_inner生成的compiled_circuit.public_inputs。main RISC-V当前主要是pc起点和pc终点。lazy init/teardown边界值来自lazy_init_data第一行和倒数第二行，用于memory argument边界处理。
+
+## 11. SimpleWitnessProxy和generated witness function
+
+SimpleWitnessProxy位于prover/src/witness_evaluator/new/simple_proxy.rs。generated witness function只依赖WitnessProxy trait，不直接访问CycleData和RowMajorTrace。
+
+### 11.1 proxy字段
+
+```rust
+// prover/src/witness_evaluator/new/simple_proxy.rs
+pub struct SimpleWitnessProxy<'a, O: Oracle<Mersenne31Field> + 'a> {
+    pub(crate) witness_row: &'a mut [Mersenne31Field],
+    pub(crate) memory_row: &'a mut [Mersenne31Field],
+    pub(crate) scratch_space: &'a mut [Mersenne31Field],
+    pub(crate) table_driver: &'a TableDriver<Mersenne31Field>,
+    pub(crate) multiplicity_counting_scratch: &'a mut [u32],
+    pub(crate) lookup_mapping_row: &'a mut [u32],
+    pub(crate) oracle: &'a O,
+    pub(crate) absolute_row_idx: usize,
+}
+```
+
+字段对应关系：
+
+1. witness_row：当前execution row的witness subtree。
+2. memory_row：当前execution row的memory subtree。
+3. scratch_space：OptimizedOut变量和generated evaluator临时值。
+4. table_driver：固定表内容。
+5. multiplicity_counting_scratch：当前线程的generic lookup计数器。
+6. lookup_mapping_row：当前row的lookup命中index数组。
+7. oracle：MainRiscVOracle。
+8. absolute_row_idx：当前row编号，用于oracle读取CycleData.per_cycle_data[absolute_row_idx]。
+
+### 11.2 读写列和oracle
+
+proxy提供witness/memory/scratch读写函数：
+
+```rust
+fn get_witness_place(&self, idx: usize) -> Mersenne31Field
+fn set_witness_place(&mut self, idx: usize, value: Mersenne31Field)
+
+fn get_memory_place(&self, idx: usize) -> Mersenne31Field
+fn set_memory_place(&mut self, idx: usize, value: Mersenne31Field)
+
+fn get_scratch_place(&self, idx: usize) -> Mersenne31Field
+fn set_scratch_place(&mut self, idx: usize, value: Mersenne31Field)
+```
+
+oracle函数把Placeholder转成VM记录：
+
+```rust
+fn get_oracle_value_u32(&self, placeholder: Placeholder) -> u32 {
+    self.oracle
+        .get_u32_witness_from_placeholder(placeholder, self.absolute_row_idx)
+}
+
+fn get_oracle_value_u16(&self, placeholder: Placeholder) -> u16 {
+    self.oracle
+        .get_u16_witness_from_placeholder(placeholder, self.absolute_row_idx)
+}
+
+fn get_oracle_value_boolean(&self, placeholder: Placeholder) -> bool {
+    self.oracle
+        .get_boolean_witness_from_placeholder(placeholder, self.absolute_row_idx)
+}
+```
+
+generated witness function由这些原语组成：读oracle，拆u32为u16，做field线性组合，执行lookup，写列。
+
+### 11.3 lookup和lookup_mapping
+
+proxy的lookup会访问TableDriver，返回固定表输出，增加multiplicity，并把absolute index写入lookup_mapping_row。
+
+```rust
+// prover/src/witness_evaluator/new/simple_proxy.rs
+fn lookup<const M: usize, const N: usize>(
+    &mut self,
+    inputs: &[Mersenne31Field; M],
+    table_id: u16,
+    lookup_mapping_idx: usize,
+) -> [Mersenne31Field; N] {
+    let (absolute_index, values) = self
+        .table_driver
+        .lookup_values_and_get_absolute_index::<N>(inputs, table_id as u32);
+    self.multiplicity_counting_scratch[absolute_index] += 1;
+    self.lookup_mapping_row[lookup_mapping_idx] = absolute_index as u32;
+
+    values
+}
+
+fn lookup_enforce<const M: usize>(
+    &mut self,
+    inputs: &[Mersenne31Field; M],
+    table_id: u16,
+    lookup_mapping_idx: usize,
+) {
+    let absolute_index = self
+        .table_driver
+        .enforce_values_and_get_absolute_index::<M>(inputs, table_id as u32);
+
+    self.multiplicity_counting_scratch[absolute_index] += 1;
+    self.lookup_mapping_row[lookup_mapping_idx] = absolute_index as u32;
+}
+```
+
+lookup和lookup_enforce的区别：
+
+1. lookup有输入和输出。比如RomRead输入rom_address，返回low/high。
+2. lookup_enforce只检查给定tuple存在于表中。比如QuickDecodeDecompositionCheck4x4x4检查[imm4_1, rs1_high, rs2_high]。
+3. 两者都会记录absolute_index和增加generic lookup multiplicity。
+
+maybe_lookup查表但不计multiplicity，也不写lookup_mapping。它用于generated evaluator里的条件辅助计算，不对应CircuitOutput.lookups中的强制query。
+
+### 11.4 generated witness前几个函数
+
+generated witness源码在circuit_defs/risc_v_cycles/generated/witness_generation_fn.rs。阅读时按操作类型识别临时变量：oracle读取、列读写、field运算、lookup和scratch读写。
+
+eval_fn_0从oracle读取pc，拆成低16位和高16位，写witness列。
+
+```rust
+// circuit_defs/risc_v_cycles/generated/witness_generation_fn.rs
+fn eval_fn_0<
+    W: WitnessTypeSet<Mersenne31Field>,
+    P: WitnessProxy<Mersenne31Field, W>,
+>(
+    witness_proxy: &mut P,
+) {
+    let v_0 = witness_proxy.get_oracle_value_u32(Placeholder::PcInit);
+    let v_1 = v_0.truncate();
+    witness_proxy.set_witness_place_u16(16usize, v_1);
+    let v_3 = v_0.shr(16u32);
+    let v_4 = v_3.truncate();
+    witness_proxy.set_witness_place_u16(75usize, v_4);
+}
+```
+
+这里的16usize和75usize来自compile_inner生成的ColumnAddress。生成器已经把Variable替换成具体列号。
+
+eval_fn_1用pc_high查询RomAddressSpaceSeparator，得到is_ram_range和rom_address_low。
+
+```rust
+fn eval_fn_1<
+    W: WitnessTypeSet<Mersenne31Field>,
+    P: WitnessProxy<Mersenne31Field, W>,
+>(
+    witness_proxy: &mut P,
+) {
+    let v_0 = witness_proxy.get_witness_place(75usize);
+    let v_1 = W::U16::constant(23u16);
+    let v_2 = witness_proxy.lookup::<1usize, 2usize>(&[v_0], v_1, 0usize);
+    let v_3 = v_2[0usize];
+    witness_proxy.set_witness_place(76usize, v_3);
+    let v_5 = v_2[1usize];
+    witness_proxy.set_witness_place(77usize, v_5);
+}
+```
+
+table_id 23对应TableType::RomAddressSpaceSeparator。lookup_mapping_idx 0表示这一行的第0个generic lookup query。proxy会写lookup_mapping_row[0]。
+
+eval_fn_2把pc_low和rom_address_low组合成rom_address，查询RomRead，得到instruction的low/high。
+
+```rust
+fn eval_fn_2<
+    W: WitnessTypeSet<Mersenne31Field>,
+    P: WitnessProxy<Mersenne31Field, W>,
+>(
+    witness_proxy: &mut P,
+) {
+    let v_0 = witness_proxy.get_witness_place(16usize);
+    let v_1 = witness_proxy.get_witness_place(77usize);
+    let mut v_4 = W::Field::constant(Mersenne31Field(0u32));
+    W::Field::add_assign_product(&mut v_4, &W::Field::constant(Mersenne31Field(1u32)), &v_0);
+    let mut v_6 = v_4;
+    W::Field::add_assign_product(&mut v_6, &W::Field::constant(Mersenne31Field(65536u32)), &v_1);
+    let v_8 = witness_proxy.lookup::<1usize, 2usize>(
+        &[v_6],
+        W::U16::constant(24u16),
+        1usize,
+    );
+    witness_proxy.set_witness_place(78usize, v_8[0usize]);
+    witness_proxy.set_witness_place(79usize, v_8[1usize]);
+}
+```
+
+公式：
+
+```text
+rom_address = pc_low + 2^16 * rom_address_low
+lookup_RomRead(rom_address) == (low, high)
+```
+
+eval_fn_3拆instruction字段，eval_fn_4和eval_fn_5执行QuickDecodeDecompositionCheck固定表检查。
+
+```rust
+fn eval_fn_3<...>(witness_proxy: &mut P) {
+    let v_0 = witness_proxy.get_witness_place_u16(78usize);
+    let v_1 = witness_proxy.get_witness_place_u16(79usize);
+    let v_2 = v_0.get_lowest_bits(7u32);
+    witness_proxy.set_witness_place_u16(83usize, v_2);
+    // 省略字段拆分...
+}
+
+fn eval_fn_4<...>(witness_proxy: &mut P) {
+    let v_0 = witness_proxy.get_witness_place(80usize);
+    let v_1 = witness_proxy.get_witness_place(81usize);
+    let v_2 = witness_proxy.get_witness_place(82usize);
+    witness_proxy.lookup_enforce::<3usize>(
+        &[v_0, v_1, v_2],
+        W::U16::constant(11u16),
+        2usize,
+    );
+}
+```
+
+generated witness function按照约束系统的列布局写trace。VM已经执行过指令；generated witness function不判断当前指令是否ADD或LOAD后再执行语义，它把VM值和由VM值派生的中间值写入trace，并执行setup固定表lookup。
+
+## 12. memory subtree witness
+
+memory subtree由evaluate_witness_inner_static_work写入。文件：prover/src/witness_evaluator/mod.rs、prover/src/witness_evaluator/memory_witness/main_circuit.rs。
+
+```rust
+// prover/src/witness_evaluator/mod.rs
+pub(crate) unsafe fn evaluate_witness_inner_static_work<O: Oracle<Mersenne31Field>>(
+    witness_row: &mut [Mersenne31Field],
+    memory_row: &mut [Mersenne31Field],
+    compiled_circuit: &CompiledCircuitArtifact<Mersenne31Field>,
+    oracle: &O,
+    absolute_row_idx: usize,
+    is_last_cycle: bool,
+    lazy_init_data: &[LazyInitAndTeardown],
+    timestamp_high_from_circuit_sequence: TimestampScalar,
+) {
+    assert!(compiled_circuit.memory_layout.batched_ram_accesses.is_empty());
+
+    process_lazy_init_work::<true>(
+        witness_row,
+        memory_row,
+        compiled_circuit,
+        absolute_row_idx,
+        is_last_cycle,
+        lazy_init_data,
+    );
+
+    process_delegation_requests(memory_row, compiled_circuit, oracle, absolute_row_idx);
+
+    process_shuffle_ram_accesses::<O, true>(
+        witness_row,
+        memory_row,
+        compiled_circuit,
+        oracle,
+        absolute_row_idx,
+        timestamp_high_from_circuit_sequence,
+    );
+
+    process_delegation_requests_execution(memory_row, compiled_circuit, oracle, absolute_row_idx);
+
+    evaluate_indirect_memory_accesses::<O, true>(
+        witness_row,
+        memory_row,
+        compiled_circuit,
+        oracle,
+        absolute_row_idx,
+    );
+}
+```
+
+main RISC-V路径中batched_ram_accesses为空。process_delegation_requests_execution和evaluate_indirect_memory_accesses主要服务delegation相关布局；main RISC-V普通3-slot访问由process_shuffle_ram_accesses写入。
+
+### 12.1 MemorySubtree布局对象
+
+文件：cs/src/definitions/memory_tree.rs、cs/src/definitions/ram_access.rs
+
+```rust
+// cs/src/definitions/memory_tree.rs
+pub struct MemorySubtree {
+    pub shuffle_ram_inits_and_teardowns: Option<ShuffleRamInitAndTeardownLayout>,
+    pub shuffle_ram_access_sets: Vec<ShuffleRamQueryColumns>,
+    pub delegation_request_layout: Option<DelegationRequestLayout>,
+    pub delegation_processor_layout: Option<DelegationProcessingLayout>,
+    pub batched_ram_accesses: Vec<BatchedRamAccessColumns>,
+    pub register_and_indirect_accesses: Vec<RegisterAndIndirectAccessDescription>,
+    pub total_width: usize,
+}
+```
+
+main RISC-V使用的字段：
+
+1. shuffle_ram_inits_and_teardowns：lazy init address、teardown value、teardown timestamp列。
+2. shuffle_ram_access_sets：3个slot的address、read timestamp、read value、write value列。
+3. delegation_request_layout：CSR delegation request列。
+4. total_width：memory_row宽度。
+
+ShuffleRamQueryColumns分Readonly和Write两类：
+
+```rust
+// cs/src/definitions/ram_access.rs
+pub enum ShuffleRamQueryColumns {
+    Readonly(ShuffleRamQueryReadColumns),
+    Write(ShuffleRamQueryWriteColumns),
+}
+
+pub struct ShuffleRamQueryReadColumns {
+    pub in_cycle_write_index: u32,
+    pub address: ShuffleRamAddress,
+    pub read_timestamp: ColumnSet<NUM_TIMESTAMP_COLUMNS_FOR_RAM>,
+    pub read_value: ColumnSet<REGISTER_SIZE>,
+}
+
+pub struct ShuffleRamQueryWriteColumns {
+    pub in_cycle_write_index: u32,
+    pub address: ShuffleRamAddress,
+    pub read_timestamp: ColumnSet<NUM_TIMESTAMP_COLUMNS_FOR_RAM>,
+    pub read_value: ColumnSet<REGISTER_SIZE>,
+    pub write_value: ColumnSet<REGISTER_SIZE>,
+}
+```
+
+Readonly query也会参与memory argument的write_record，但write_value等于read_value，所以memory_row只需要一组value列。Write query需要read_value和write_value两组列。
+
+### 12.2 lazy init和teardown
+
+lazy_init_data由VM运行结束后的RAM access_bitmask、RAM最终值和RAM最后timestamp整理得到。每个chunk拿到一段LazyInitAndTeardown列表。evaluate_witness要求lazy_init_data.len() == cycles。
+
+process_lazy_init_work写当前行的lazy init address、teardown value和teardown timestamp。
+
+```rust
+// prover/src/witness_evaluator/memory_witness/main_circuit.rs
+pub(crate) unsafe fn process_lazy_init_work<const COMPUTE_WITNESS: bool>(
+    witness_row: &mut [Mersenne31Field],
+    memory_row: &mut [Mersenne31Field],
+    compiled_circuit: &CompiledCircuitArtifact<Mersenne31Field>,
+    absolute_row_idx: usize,
+    _is_last_cycle: bool,
+    lazy_init_data: &[LazyInitAndTeardown],
+) {
+    if let Some(lazy_init_and_teardown) = compiled_circuit
+        .memory_layout
+        .shuffle_ram_inits_and_teardowns
+    {
+        let lazy_init = lazy_init_data[absolute_row_idx];
+        let LazyInitAndTeardown {
+            address: this_row_lazy_init_address,
+            teardown_value: this_row_teardown_value,
+            teardown_timestamp: this_row_teardown_timestamp,
+        } = lazy_init;
+
+        write_u32_value_into_memory_columns(
+            lazy_init_and_teardown.lazy_init_addresses_columns,
+            this_row_lazy_init_address,
+            memory_row,
+        );
+        write_u32_value_into_memory_columns(
+            lazy_init_and_teardown.lazy_teardown_values_columns,
+            this_row_teardown_value,
+            memory_row,
+        );
+        write_timestamp_value_into_memory_columns(
+            lazy_init_and_teardown.lazy_teardown_timestamps_columns,
+            this_row_teardown_timestamp.as_scalar(),
+            memory_row,
+        );
+        // 省略辅助变量...
+    }
+}
+```
+
+COMPUTE_WITNESS为true时，函数还计算lazy init地址排序辅助变量。它比较当前行address和下一行address，调用u32_split_sub。
+
+```rust
+let (((aux_low, aux_high), intermediate_borrow_value), final_borrow_value) =
+    u32_split_sub(this_row_lazy_init_address, next_row_lazy_init_address);
+
+write_value(low_place, Mersenne31Field(aux_low as u32), witness_row, &mut []);
+write_value(high_place, Mersenne31Field(aux_high as u32), witness_row, &mut []);
+write_value(intermediate_borrow, Mersenne31Field::from_boolean(intermediate_borrow_value), witness_row, &mut []);
+write_value(final_borrow, Mersenne31Field::from_boolean(final_borrow_value), witness_row, &mut []);
+```
+
+对应setup章节里的约束：
+
+```text
+tmp_low(k) = 2^16 * borrow(k) + addr_low(k) - addr_low(k + 1)
+tmp_high(k) = 2^16 * final_borrow(k) + addr_high(k) - addr_high(k + 1) - borrow(k)
+
+tmp_low(k) ∈ rows(RangeCheck16)
+tmp_high(k) ∈ rows(RangeCheck16)
+borrow(k) * (borrow(k) - 1) == 0
+final_borrow(k) * (final_borrow(k) - 1) == 0
+```
+
+final_borrow_value为false时，源码要求当前行是padding行，address、teardown value和teardown timestamp都为0。
+
+```rust
+if final_borrow_value == false {
+    assert_eq!(this_row_lazy_init_address, 0);
+    assert_eq!(this_row_teardown_value, 0);
+    assert_eq!(this_row_teardown_timestamp.as_scalar(), 0);
+}
+```
+
+最后一行没有next row时，函数手动把final_borrow写成true。setup约束对最后一行的padding处理依赖这个值。
+
+### 12.3 delegation request列
+
+process_delegation_requests把ExecuteDelegation、DelegationType和DegelationABIOffset写到memory_row。
+
+```rust
+// prover/src/witness_evaluator/memory_witness/main_circuit.rs
+pub(crate) unsafe fn process_delegation_requests<O: Oracle<Mersenne31Field>>(
+    memory_row: &mut [Mersenne31Field],
+    compiled_circuit: &CompiledCircuitArtifact<Mersenne31Field>,
+    oracle: &O,
+    absolute_row_idx: usize,
+) {
+    if let Some(delegation_request_layout) =
+        compiled_circuit.memory_layout.delegation_request_layout
+    {
+        write_boolean_placeholder_into_memory_columns(
+            delegation_request_layout.multiplicity,
+            Placeholder::ExecuteDelegation,
+            oracle,
+            memory_row,
+            absolute_row_idx,
+        );
+        write_u16_placeholder_into_memory_columns(
+            delegation_request_layout.delegation_type,
+            Placeholder::DelegationType,
+            oracle,
+            memory_row,
+            absolute_row_idx,
+        );
+        write_u16_placeholder_into_memory_columns(
+            delegation_request_layout.abi_mem_offset_high,
+            Placeholder::DegelationABIOffset,
+            oracle,
+            memory_row,
+            absolute_row_idx,
+        );
+    }
+}
+```
+
+MainRiscVOracle中ExecuteDelegation由cycle_data.delegation_request != 0得到，DelegationType返回cycle_data.delegation_request，DegelationABIOffset当前返回0。delegation内部witness不在main RISC-V章节展开。
+
+### 12.4 shuffle RAM三组访问
+
+process_shuffle_ram_accesses遍历compiled_circuit.memory_layout.shuffle_ram_access_sets，按access_idx从oracle读取地址、read timestamp、read value和write value。
+
+```rust
+// prover/src/witness_evaluator/memory_witness/main_circuit.rs
+for (access_idx, mem_query) in compiled_circuit
+    .memory_layout
+    .shuffle_ram_access_sets
+    .iter()
+    .enumerate()
+{
+    match mem_query.get_address() {
+        ShuffleRamAddress::RegisterOnly(RegisterOnlyAccessAddress { register_index }) => {
+            write_u16_placeholder_into_memory_columns(
+                register_index,
+                Placeholder::ShuffleRamAddress(access_idx),
+                oracle,
+                memory_row,
+                absolute_row_idx,
+            );
+        }
+        ShuffleRamAddress::RegisterOrRam(RegisterOrRamAccessAddress {
+            is_register,
+            address,
+        }) => {
+            let is_register_flag =
+                Oracle::<Mersenne31Field>::get_boolean_witness_from_placeholder(
+                    oracle,
+                    Placeholder::ShuffleRamIsRegisterAccess(access_idx),
+                    absolute_row_idx,
+                );
+            memory_row[is_register.start()] = Mersenne31Field::from_boolean(is_register_flag);
+
+            write_u32_placeholder_into_memory_columns(
+                address,
+                Placeholder::ShuffleRamAddress(access_idx),
+                oracle,
+                memory_row,
+                absolute_row_idx,
+            );
+        }
+    }
+
+    write_timestamp_placeholder_into_memory_columns(
+        mem_query.get_read_timestamp_columns(),
+        Placeholder::ShuffleRamReadTimestamp(access_idx),
+        oracle,
+        memory_row,
+        absolute_row_idx,
+    );
+
+    write_u32_placeholder_into_memory_columns(
+        mem_query.get_read_value_columns(),
+        Placeholder::ShuffleRamReadValue(access_idx),
+        oracle,
+        memory_row,
+        absolute_row_idx,
+    );
+
+    if let ShuffleRamQueryColumns::Write(columns) = mem_query {
+        write_u32_placeholder_into_memory_columns(
+            columns.write_value,
+            Placeholder::ShuffleRamWriteValue(access_idx),
+            oracle,
+            memory_row,
+            absolute_row_idx,
+        );
+    }
+    // 省略timestamp比较辅助变量...
+}
+```
+
+access_idx和CycleData字段对应：
+
+```text
+access_idx = 0:
+  address = rs1_reg_idx
+  is_register = true
+  read_value = rs1_read_value
+  write_value = rs1_read_value
+  read_timestamp = rs1_read_timestamp
+
+access_idx = 1:
+  address = rs2_or_mem_word_address.as_u32_formal_address()
+  is_register = rs2_or_mem_word_address.is_register()
+  read_value = rs2_or_mem_word_read_value
+  write_value = rs2_or_mem_word_read_value
+  read_timestamp = rs2_or_mem_read_timestamp
+
+access_idx = 2:
+  address = rd_or_mem_word_address.as_u32_formal_address()
+  is_register = rd_or_mem_word_address.is_register()
+  read_value = rd_or_mem_word_read_value
+  write_value = rd_or_mem_word_write_value
+  read_timestamp = rd_or_mem_read_timestamp
+```
+
+timestamp比较辅助变量也在process_shuffle_ram_accesses中写入。write timestamp由circuit_sequence、absolute_row_idx和access_idx计算。
+
+```rust
+let write_timestamp_base = timestamp_high_from_circuit_sequence
+    + (((absolute_row_idx + 1) as TimestampScalar) << NUM_EMPTY_BITS_FOR_RAM_TIMESTAMP);
+
+let (write_timestamp_low, write_timestamp_high) =
+    split_timestamp(write_timestamp_base + (access_idx as TimestampScalar));
+
+let (((_aux_low, _aux_high), intermediate_borrow), final_borrow) = timestamp_sub(
+    (read_timestamp_low, read_timestamp_high),
+    (write_timestamp_low, write_timestamp_high),
+);
+
+assert!(final_borrow, "failed to compare memory access timestamps...");
+
+write_value(
+    borrow_place,
+    Mersenne31Field::from_boolean(intermediate_borrow),
+    witness_row,
+    &mut [],
+);
+```
+
+约束表达式来自compile_inner：
+
+```text
+read_timestamp = read_low + 2^ts_bits * read_high
+write_timestamp = (write_low + local_timestamp_in_cycle) + 2^ts_bits * write_high
+
+timestamp_low_expr = 2^ts_bits * borrow + read_low - write_low - local_timestamp_in_cycle
+timestamp_high_expr = read_high - write_high - borrow + 2^ts_bits
+
+timestamp_low_expr ∈ rows(TimestampRangeCheck)
+timestamp_high_expr ∈ rows(TimestampRangeCheck)
+borrow * (borrow - 1) == 0
+```
+
+process_shuffle_ram_accesses只计算borrow并写入witness列。timestamp_low_expr和timestamp_high_expr的multiplicity在count_special_range_check_multiplicities中计算。
+
+### 12.5 memory-only witness
+
+trace_and_split里还有一条memory-only路径：commit_memory_tree_for_riscv_circuit_using_gpu_tracer只生成memory trace并承诺memory tree。它调用evaluate_memory_witness，不调用generated witness function。
+
+```rust
+// circuit_defs/trace_and_split/src/lib.rs
+pub fn commit_memory_tree_for_riscv_circuit_using_gpu_tracer<C: MachineConfig, A: GoodAllocator>(
+    compiled_machine: &CompiledCircuitArtifact<Mersenne31Field>,
+    witness_chunk: &CycleData<C>,
+    inits_and_teardowns: &ShuffleRamSetupAndTeardown,
+    _circuit_sequence: usize,
+    twiddles: &Twiddles<Mersenne31Complex, A>,
+    lde_precomputations: &LdePrecomputations<A>,
+    worker: &Worker,
+) -> (Vec<MerkleTreeCapVarLength>, WitnessEvaluationAuxData) {
+    let trace_len = witness_chunk.num_cycles_chunk_size + 1;
+    let num_cycles_in_chunk = trace_len - 1;
+
+    let oracle = MainRiscVOracle {
+        cycle_data: witness_chunk,
+    };
+
+    let memory_chunk = evaluate_memory_witness(
+        compiled_machine,
+        num_cycles_in_chunk,
+        &oracle,
+        &inits_and_teardowns.lazy_init_data,
+        &worker,
+        A::default(),
+    );
+    // 省略LDE和Merkle tree构造...
+}
+```
+
+evaluate_memory_witness只分配memory_trace，不分配witness_row和lookup_mapping。内部调用evaluate_memory_witness_inner：
+
+```rust
+// prover/src/witness_evaluator/memory_witness/main_circuit.rs
+pub(crate) unsafe fn evaluate_memory_witness_inner<O: Oracle<Mersenne31Field>>(
+    witness_row: &mut [Mersenne31Field],
+    memory_row: &mut [Mersenne31Field],
+    compiled_circuit: &CompiledCircuitArtifact<Mersenne31Field>,
+    oracle: &O,
+    absolute_row_idx: usize,
+    is_last_cycle: bool,
+    lazy_init_data: &[LazyInitAndTeardown],
+) {
+    process_lazy_init_work::<false>(
+        witness_row,
+        memory_row,
+        compiled_circuit,
+        absolute_row_idx,
+        is_last_cycle,
+        lazy_init_data,
+    );
+
+    process_delegation_requests(memory_row, compiled_circuit, oracle, absolute_row_idx);
+
+    process_shuffle_ram_accesses::<O, false>(
+        witness_row,
+        memory_row,
+        compiled_circuit,
+        oracle,
+        absolute_row_idx,
+        0,
+    );
+}
+```
+
+COMPUTE_WITNESS=false时，memory-only路径写address、read timestamp、read value、write value、lazy init和teardown列，不写lazy init排序辅助变量和shuffle RAM timestamp borrow。full witness路径会写这些辅助变量，因为它需要完整witness subtree。
+
+## 13. multiplicity和lookup_mapping
+
+lookup argument需要知道witness每行查询了哪些固定表行，以及每个固定表行被查询多少次。Airbender在witness阶段生成两类数据：
+
+1. lookup_mapping：每行每个generic lookup query命中的absolute table index。
+2. multiplicity columns：固定表每一行被查询的次数。
+
+### 13.1 generic lookup计数
+
+SimpleWitnessProxy::lookup和lookup_enforce处理generic lookup。每次lookup都会：
+
+```text
+absolute_index = table_driver.lookup_values_and_get_absolute_index(...)
+generic_lookup_multiplicities[absolute_index] += 1
+lookup_mapping_row[lookup_mapping_idx] = absolute_index
+```
+
+absolute_index是所有generic fixed table拼接后的全局行号。table_offsets记录每张TableType在拼接表中的起始位置，total_tables_size记录总长度。
+
+```text
+absolute_index =
+  table_offsets[TableType]
+  + row_index_inside_that_table
+```
+
+RomRead、OpTypeBitmask、SpecialCSRProperties、RangeCheckSmall、decoder辅助表等都进入generic lookup流。RangeCheck16和TimestampRangeCheck走special path。
+
+### 13.2 special range multiplicity
+
+count_special_range_check_multiplicities处理两类special lookup：
+
+1. witness_layout.range_check_16_lookup_expressions
+2. witness_layout.timestamp_range_check_lookup_expressions
+
+RangeCheck16分trivial和nontrivial两段。trivial表达式是直接放在witness subtree列中的16-bit变量；nontrivial表达式需要计算CompiledDegree1Constraint。
+
+```rust
+// prover/src/witness_evaluator/mod.rs
+let num_trivial_relations = compiled_circuit
+    .witness_layout
+    .range_check_16_columns
+    .num_elements();
+
+for range_check_expression in compiled_circuit
+    .witness_layout
+    .range_check_16_lookup_expressions[..num_trivial_relations]
+    .iter()
+{
+    let LookupExpression::Variable(place) = range_check_expression else {
+        unreachable!()
+    };
+    let ColumnAddress::WitnessSubtree(offset) = place else {
+        unreachable!()
+    };
+    let value = *witness_trace_view_row.get_unchecked(*offset);
+    assert!(value.to_reduced_u32() <= u16::MAX as u32);
+    let index = value.to_reduced_u32() as usize;
+    *range_check_16_multiplicieties.get_unchecked_mut(index) += 1;
+}
+```
+
+nontrivial RangeCheck16表达式可能来自lazy init地址排序的tmp_low/tmp_high，也可能来自其它compile_inner生成的range check表达式。
+
+```rust
+for range_check_expression in nontrivial_range_check_16_relations.iter() {
+    let value = match range_check_expression {
+        LookupExpression::Variable(place) => {
+            // 读取witness列
+        }
+        LookupExpression::Expression(constraint) => constraint
+            .evaluate_at_row_on_main_domain(&*witness_trace_view_row, &*memory_trace_view_row),
+    };
+    assert!(value.to_reduced_u32() <= u16::MAX as u32);
+    let index = value.to_reduced_u32() as usize;
+    *range_check_16_multiplicieties.get_unchecked_mut(index) += 1;
+}
+```
+
+lazy init address本身也需要进入RangeCheck16 multiplicity。源码从memory_row读lazy_init_addresses_columns两个limb并计数。
+
+### 13.3 timestamp multiplicity
+
+timestamp range check表达式分两段：普通timestamp表达式和shuffle RAM timestamp表达式。shuffle RAM表达式需要读取setup_row中的timestamp_setup_columns。
+
+evaluate_witness_inner每行临时构造setup_row，只包含本行setup timestamp低/高两列：
+
+```rust
+let [timestamp_low, timestamp_high] =
+    row_into_timestamp_limbs_for_setup(absolute_row_idx as u32);
+let setup_row = [
+    Mersenne31Field(timestamp_low),
+    Mersenne31Field(timestamp_high),
+];
+```
+
+shuffle RAM timestamp high表达式还需要减去circuit_sequence贡献：
+
+```rust
+let timestamp_high_contribution_if_shuffle_ram = Mersenne31Field(
+    (timestamp_high_from_circuit_sequence >> TIMESTAMP_COLUMNS_NUM_BITS) as u32,
+);
+```
+
+count_special_range_check_multiplicities对shuffle RAM timestamp每两个表达式组成一组low/high：
+
+```rust
+for [low, high] in shuffle_ram_partial_expressions.as_chunks::<2>().0.iter() {
+    let LookupExpression::Expression(constraint_low) = low else {
+        unreachable!()
+    };
+    let low_value = constraint_low.evaluate_at_row_on_main_domain_ext(
+        &*witness_trace_view_row,
+        &*memory_trace_view_row,
+        setup_trace_view_row,
+    );
+    assert!(low_value.to_reduced_u32() < (1 << TIMESTAMP_COLUMNS_NUM_BITS));
+    *timestamp_range_check_multiplicieties.get_unchecked_mut(low_value.to_reduced_u32() as usize) += 1;
+
+    let LookupExpression::Expression(constraint_high) = high else {
+        unreachable!()
+    };
+    let mut high_value = constraint_high.evaluate_at_row_on_main_domain_ext(
+        &*witness_trace_view_row,
+        &*memory_trace_view_row,
+        setup_trace_view_row,
+    );
+    high_value.sub_assign(&timestamp_high_contribution_if_shuffle_ram);
+    assert!(high_value.to_reduced_u32() < (1 << TIMESTAMP_COLUMNS_NUM_BITS));
+    *timestamp_range_check_multiplicieties.get_unchecked_mut(high_value.to_reduced_u32() as usize) += 1;
+}
+```
+
+公式：
+
+```text
+timestamp_low_expr_value < 2^TIMESTAMP_COLUMNS_NUM_BITS
+timestamp_high_expr_value < 2^TIMESTAMP_COLUMNS_NUM_BITS
+
+timestamp_range_check_multiplicity[value] += 1
+```
+
+这个函数只统计multiplicity。它不重算VM执行语义。
+
+### 13.4 multiplicity写回
+
+postprocess_multiplicities把每个线程的计数器相加，再写入exec_trace的witness subtree。
+
+RangeCheck16 multiplicity写入前2^16行对应列：
+
+```rust
+let offset = compiled_circuit
+    .witness_layout
+    .multiplicities_columns_for_range_check_16
+    .start();
+let mut view = exec_trace.row_view(0..1 << 16);
+for absolute_row_idx in 0..(1 << 16) {
+    let (row, _) = view.current_row_split(num_witness_columns);
+    let multiplicity = range_16_multiplicities[absolute_row_idx];
+    row[offset] = Mersenne31Field(multiplicity as u32);
+    view.advance_row();
+}
+```
+
+TimestampRangeCheck multiplicity写入前2^TIMESTAMP_COLUMNS_NUM_BITS行对应列。generic lookup multiplicity按setup generic lookup列组编码写入：
+
+```rust
+let encoding_capacity = trace_len - 1;
+let multiplicities_range = compiled_circuit
+    .witness_layout
+    .multiplicities_columns_for_generic_lookup
+    .full_range();
+
+for (column, dst) in dst.iter_mut().enumerate() {
+    let encoding_index = encoding_tuple_into_lookup_index(
+        column as u32,
+        absolute_row_idx as u32,
+        encoding_capacity,
+    );
+    if encoding_index < general_purpose_multiplicity_ref.len() {
+        let multiplicity = general_purpose_multiplicity_ref[encoding_index];
+        *dst = Mersenne31Field(multiplicity as u32);
+    }
+}
+```
+
+encoding_index和setup trace中generic lookup固定表的写入方式一致：
+
+```text
+encoding_capacity = trace_len - 1
+absolute_table_index = column * encoding_capacity + row
+```
+
+setup trace在同一个column/row位置写固定表row内容，witness trace在同一个column/row位置写multiplicity。
+
+## 14. 三条字段阅读路径
+
+### 14.1 pc到RomRead
+
+pc路径把VM、oracle、generated witness、TableDriver和lookup_mapping连在一起。
+
+执行顺序：
+
+1. VM在cycle开始时调用GPUFriendlyTracer::at_cycle_start_ext。
+2. tracer把current_state.observable.pc写入cycle_data.pc。
+3. generated eval_fn_0调用get_oracle_value_u32(Placeholder::PcInit)。
+4. SimpleWitnessProxy转发给MainRiscVOracle。
+5. MainRiscVOracle返回cycle_data.per_cycle_data[row].pc。
+6. eval_fn_0把pc拆成pc_low和pc_high，写witness列。
+7. eval_fn_1用pc_high查RomAddressSpaceSeparator。
+8. eval_fn_2组合rom_address并查RomRead。
+9. proxy把两次lookup命中的absolute index写入lookup_mapping_row[0]和lookup_mapping_row[1]。
+
+对应公式：
+
+```text
+pc == pc_low + 2^16 * pc_high
+
+lookup_RomAddressSpaceSeparator(pc_high) == (is_ram_range, rom_address_low)
+is_ram_range == 0
+
+rom_address = pc_low + 2^16 * rom_address_low
+lookup_RomRead(rom_address) == (low, high)
+instruction = low + 2^16 * high
+```
+
+这条路径里，VM只提供pc。low/high opcode来自TableDriver里的RomRead固定表。RomRead表内容来自setup阶段的bytecode。
+
+### 14.2 LOAD的slot1和slot2
+
+LOAD会把slot1改成RAM read，slot2保持rd register write。
+
+VM/tracer阶段：
+
+```text
+slot0:
+  trace_rs1_read(base register)
+  address = rs1_reg_idx
+  read_value = rs1 value
+  read_timestamp = previous timestamp of rs1
+
+slot1:
+  trace_ram_read(phys_address, memory_value)
+  address = RAM byte address
+  is_register = false
+  read_value = memory_value
+  read_timestamp = previous timestamp of RAM word
+
+slot2:
+  trace_rd_write(rd, old_rd_value, loaded_value)
+  address = rd index
+  is_register = true
+  read_value = old rd value
+  write_value = loaded_value
+  read_timestamp = previous timestamp of rd
+```
+
+witness阶段：
+
+1. MainRiscVOracle对ShuffleRamAddress(1)返回rs2_or_mem_word_address.as_u32_formal_address。
+2. MainRiscVOracle对ShuffleRamIsRegisterAccess(1)返回false。
+3. process_shuffle_ram_accesses把slot1 address、is_register、read_timestamp、read_value写进memory_row。
+4. slot1是Readonly query，因此write_record使用同一个read_value。
+5. slot2是Write query，process_shuffle_ram_accesses写rd read_value和write_value。
+6. process_shuffle_ram_accesses计算slot1和slot2的timestamp borrow。
+
+对应record：
+
+```text
+slot1 RAM read:
+  read_record  = (ram_address, read_timestamp, memory_value)
+  write_record = (ram_address, write_timestamp_slot1, memory_value)
+
+slot2 rd write:
+  read_record  = (rd_index, read_timestamp, old_rd_value)
+  write_record = (rd_index, write_timestamp_slot2, loaded_value)
+```
+
+LOAD opcode语义本身由describe_state_transition生成的degree约束和lookup约束检查。process_shuffle_ram_accesses只写memory subtree值和timestamp辅助变量。
+
+### 14.3 STORE的slot2
+
+STORE会保持slot1为rs2 register read，把slot2改成RAM write。
+
+VM/tracer阶段：
+
+```text
+slot0:
+  rs1 base register read
+
+slot1:
+  rs2 register read
+  read_value = value to store
+
+slot2:
+  RAM read/write
+  address = effective RAM byte address
+  read_value = old RAM word
+  write_value = new RAM word
+```
+
+trace_ram_read_write会assert不能写ROM，并调用mark_ram_slot_use得到旧RAM word的read_timestamp。
+
+witness阶段：
+
+1. ShuffleRamIsRegisterAccess(2)返回false。
+2. ShuffleRamAddress(2)返回RAM byte address。
+3. ShuffleRamReadValue(2)返回old RAM word。
+4. ShuffleRamWriteValue(2)返回new RAM word。
+5. memory_row写slot2的address、read_timestamp、read_value、write_value。
+
+STORE对某个byte/half/word的写入如何合成new RAM word，属于LoadOp/StoreOp在describe_state_transition中登记的opcode语义约束。VM tracer只记录结果值。
+
+### 14.4 fixed lookup multiplicity
+
+RomRead lookup从generated witness到multiplicity的路径：
+
+```text
+eval_fn_2:
+  lookup::<1, 2>(&[rom_address], RomRead_table_id, lookup_mapping_idx = 1)
+
+SimpleWitnessProxy:
+  (absolute_index, [low, high]) =
+    table_driver.lookup_values_and_get_absolute_index([rom_address], RomRead)
+
+  generic_lookup_multiplicities[absolute_index] += 1
+  lookup_mapping_row[1] = absolute_index
+
+postprocess_multiplicities:
+  multiplicity column/row =
+    encoding_tuple_into_lookup_index(column, row, trace_len - 1)
+```
+
+setup trace里同一个absolute_index位置保存RomRead固定表行，witness trace里同一个位置保存multiplicity。lookup_mapping每个execution row记录这行query命中了哪个absolute_index。
+
+## 15. witness生成和证明检查的边界
+
+witness阶段写trace，不完成证明检查。evaluate_witness里有assert，但这些assert属于工程侧快速失败：
+
+1. cycles == trace_len - 1。
+2. table_driver.total_tables_len == compiled_circuit.total_tables_size。
+3. range check表达式值小于表范围。
+4. read timestamp < write timestamp。
+5. lazy init padding行的address/value/timestamp为0。
+
+这些assert不会替代AIR约束、lookup argument和memory argument。后续prover stages会消费以下对象：
+
+```text
+setup:
+  SetupPrecomputations
+  setup_layout
+  table_driver fixed table rows
+
+witness:
+  exec_trace
+  lookup_mapping
+  aux_data
+
+compiled circuit:
+  degree_1_constraints
+  degree_2_constraints
+  state_linkage_constraints
+  public_inputs
+  witness_layout
+  memory_layout
+  stage_2_layout
+```
+
+stage1会承诺witness/memory trace。stage2会使用setup trace、multiplicity columns、lookup_mapping和memory layout构造lookup/memory argument中间trace。quotient evaluator会检查普通degree约束、state linkage、public inputs和stage2 argument约束。
+
+本笔记在VM和witness阶段停止。PCS、FRI、transcript和quotient composition只作为下游消费者出现。
+
+## 16. VM-witness阅读路线
+
+源码阅读顺序按对象产生顺序排列：
+
+1. circuit_defs/setups/src/circuits/main_riscv/mod.rs  
+   读取MainCircuitPrecomputations里compiled_circuit、table_driver和witness_eval_fn_for_gpu_tracer。
+
+2. circuit_defs/risc_v_cycles/src/lib.rs  
+   读取DOMAIN_SIZE、NUM_CYCLES和witness_eval_fn_for_gpu_tracer。
+
+3. circuit_defs/trace_and_split/src/lib.rs  
+   读取run_till_end_for_gpu_for_machine_config，确认VM如何创建memory、state和GPUFriendlyTracer。
+
+4. prover/src/tracers/main_cycle_optimized.rs  
+   读取SingleCycleTracingData、CycleData、RegIndexOrMemWordIndex、RamTracingData和Tracer<C>实现。
+
+5. prover/src/tracers/oracles/main_risc_v_circuit.rs  
+   读取Placeholder到CycleData字段的映射。
+
+6. prover/src/witness_evaluator/new/mod.rs  
+   读取evaluate_witness、evaluate_witness_inner和每行写trace顺序。
+
+7. prover/src/witness_evaluator/new/simple_proxy.rs  
+   读取SimpleWitnessProxy如何读写列、访问oracle、查TableDriver、记录lookup_mapping。
+
+8. prover/src/witness_evaluator/memory_witness/main_circuit.rs  
+   读取process_lazy_init_work、process_delegation_requests和process_shuffle_ram_accesses。
+
+9. prover/src/witness_evaluator/mod.rs  
+   读取count_special_range_check_multiplicities和postprocess_multiplicities。
+
+10. circuit_defs/risc_v_cycles/generated/witness_generation_fn.rs  
+    只追少量字段路径。pc路径从eval_fn_0到eval_fn_5最适合连接VM值、fixed lookup和witness列。
+
+最终形成的对象关系如下：
+
+```text
+bytecode
+  -> setup阶段生成RomRead和CompiledCircuitArtifact
+
+VM run_cycles
+  -> GPUFriendlyTracer
+  -> CycleData
+  -> MainRiscVOracle
+
+evaluate_witness
+  -> static memory work写memory_row
+  -> generated witness function写witness_row
+  -> SimpleWitnessProxy查TableDriver
+  -> lookup_mapping
+  -> multiplicity columns
+  -> WitnessEvaluationData
+```
+
+CycleData、Oracle和SimpleWitnessProxy之间的边界要保持分开：
+
+1. CycleData保存VM事实。
+2. MainRiscVOracle按Placeholder返回VM事实。
+3. SimpleWitnessProxy按ColumnAddress写trace列，并负责fixed lookup计数。
+4. generated witness function把setup阶段编译出的列布局和VM事实连接起来。

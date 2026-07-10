@@ -7,6 +7,7 @@ use std::alloc::Global;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "Vec<LazyInitAndTeardown, A>: serde::Serialize + serde::de::DeserializeOwned")]
+/// 某一个main circuit chunk对应的一整段lazy init/teardown行数据
 pub struct ShuffleRamSetupAndTeardown<A: GoodAllocator = Global> {
     pub lazy_init_data: Vec<LazyInitAndTeardown, A>,
 }
@@ -18,12 +19,16 @@ pub struct RamShuffleMemStateRecord {
 }
 
 #[derive(Clone, Debug)]
+/// ROM和RAM物理上存在同一个vector里，只是用rom_bound划分：
+/// address < rom_bound: ROM区域
+/// address >= rom_bound: RAM区域
 pub struct VectorMemoryImplWithRom {
     ram: Vec<u32>,
     pub rom_bound: usize,
 }
 
 impl VectorMemoryImplWithRom {
+    /// 按u32存储，不是按byte存储。因为Airbender这条路径主要以32-bit word处理指令和RAM word。
     pub fn new_for_byte_size(bytes: usize, rom_bound: usize) -> Self {
         assert!(rom_bound.is_power_of_two());
 
@@ -53,7 +58,14 @@ impl VectorMemoryImplWithRom {
             address += 1;
         }
     }
-
+    /// 虽然内部用一个Vec<u32>同时存ROM和RAM，但最终收集RAM teardown时不应该把ROM内容也暴露出来。
+    /// 因为ROM内容已经由setup的RomRead固定表承诺了。memory teardown只关心可变RAM区域。
+    /// 所以函数做：    final_memory_state = memory.ram
+    /// 但把前rom_bound范围清零，也就是：
+    /// ROM区域:
+    /// 不作为RAM final state输出
+    /// RAM区域:
+    /// 保留最终值
     pub fn get_final_ram_state(self) -> Vec<u32> {
         // NOTE: important: even though we use single allocation for ROM and RAM,
         // we should NOT expose ROM values, so we will instead zero-out

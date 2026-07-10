@@ -365,8 +365,12 @@ fn split_u32_into_pair_u16(num: u32) -> (u32, u32) {
     Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, Hash,
 )]
 #[repr(C)]
+/// address字段用于表示这一行要处理哪个RAM地址的初始化边界，teardown_value + teardown_timestamp用于表示该地址最终状态
 pub struct LazyInitAndTeardown {
+    /// RAM byte address，用于表示这一行要处理哪个RAM地址的初始化边界
     pub address: u32,
+    /// 程序执行结束时，这个RAM word的最终值
     pub teardown_value: u32,
+    /// 程序执行结束时，这个RAM word最后一次访问timestamp
     pub teardown_timestamp: TimestampData,
 }

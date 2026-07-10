@@ -60,6 +60,9 @@ pub fn is_final_reduced_machine_configuration<C: MachineConfig>() -> bool {
 
 pub fn delegation_factories_for_machine<C: MachineConfig, A: GoodAllocator>(
 ) -> HashMap<u16, Box<dyn Fn() -> prover::tracers::delegation::DelegationWitness<A>>> {
+    // 对default machine，也就是IMStandardIsaConfig，它返回两类工厂：
+    // Blake2 delegation witness factory
+    // BigInt delegation witness factory
     if is_default_machine_configuration::<C>()
         || is_machine_without_signed_mul_div_configuration::<C>()
     {

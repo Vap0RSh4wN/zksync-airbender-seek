@@ -51,6 +51,7 @@ pub const fn timestamp_from_absolute_cycle_index(
 }
 
 #[inline]
+/// 算的是当前cycle的base timestamp，不是slot timestamp。slot timestamp还要再加slot编号
 pub const fn timestamp_from_chunk_cycle_and_sequence(
     cycle_in_chunk: usize,
     chunk_capacity: usize,
@@ -60,6 +61,13 @@ pub const fn timestamp_from_chunk_cycle_and_sequence(
     debug_assert!(trace_len.is_power_of_two());
     debug_assert!(cycle_in_chunk < trace_len);
 
+    // NITIAL_TIMESTAMP_AT_CHUNK_START：当前chunk里第0个cycle的base timestamp，等于4
+    // TIMESTAMP_STEP * cycle_in_chunk：
+    //   当前chunk里第几个cycle
+    //   每个cycle占4个timestamp空间
+    // timestamp_high_contribution_from_circuit_sequence：
+    //   第几个chunk/circuit instance
+    //   防止不同chunk之间timestamp冲突
     let timestamp = INITIAL_TIMESTAMP_AT_CHUNK_START
         + TIMESTAMP_STEP * (cycle_in_chunk as TimestampScalar)
         + timestamp_high_contribution_from_circuit_sequence(circuit_sequence, trace_len);

@@ -1,16 +1,22 @@
 pub const OP_AND_FUNCT3_MASK: u32 = 0x7f | 0x7 << (7 + 5);
 pub const OP_AND_FUNCT3_AND_FUNCT7_MASK: u32 = 0x7f | 0x7 << (7 + 5) | 0x7f << (32 - 7);
 
+/// I-type算术，如ADDI、ANDI、ORI
 pub const OP_IMM_SUBMASK: u8 = 0b0010011;
+/// R-type算术，如ADD、SUB、MUL
 pub const OP_SUBMASK: u8 = 0b0110011;
 
 pub const OPCODE_LUI: u8 = 0b0110111;
 pub const OPCODE_AUIPC: u8 = 0b0010111;
 pub const OPCODE_JAL: u8 = 0b1101111;
 pub const OPCODE_JALR: u8 = 0b1100111;
+/// 分支类，如BEQ、BNE
 pub const OPCODE_BRANCH: u8 = 0b1100011;
+/// LOAD类，如LW
 pub const OPCODE_LOAD: u8 = 0b0000011;
+/// STORE类，如SW
 pub const OPCODE_STORE: u8 = 0b0100011;
+/// CSR、MOP、系统类
 pub const OPCODE_SYSTEM: u8 = 0b1110011;
 
 pub(crate) const SUB_FUNCT7: u8 = 0b0100000;

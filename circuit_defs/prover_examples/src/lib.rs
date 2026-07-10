@@ -94,6 +94,7 @@ pub fn prove_image_execution<
     delegation_circuits_precomputations: &[(u32, DelegationCircuitPrecomputations<A>)],
     worker: &worker::Worker,
 ) -> (Vec<Proof>, Vec<(u32, Vec<Proof>)>, Vec<FinalRegisterValue>) {
+    // IMStandardIsaConfig = main RISC-V使用的标准ISA配置
     prove_image_execution_for_machine_with_gpu_tracers::<ND, IMStandardIsaConfig, A>(
         num_instances_upper_bound,
         bytecode,
@@ -152,37 +153,41 @@ pub fn prove_image_execution_on_final_reduced_machine<
         worker,
     )
 }
-
+/// 计算cycles_per_circuit和max_cycles_to_run，创建delegation_factories，调用run_and_split_for_gpu，然后把RAM lazy init/teardown数据按main circuit chunk切好
 pub fn trace_execution_for_gpu<
     ND: NonDeterminismCSRSource<VectorMemoryImplWithRom>,
     C: MachineConfig,
     A: GoodAllocator,
 >(
+    //最多允许多少个main RISC-V circuit instance
     num_instances_upper_bound: usize,
     bytecode: &[u32],
     mut non_determinism: ND,
     trace_len: usize,
     worker: &worker::Worker,
 ) -> (
-    Vec<CycleData<C>>,
+    Vec<CycleData<C>>, //main RISC-V VM execution chunks，每个CycleData是一段VM cycles的记录。
     (
-        usize, // number of empty ones to assume
-        Vec<ShuffleRamSetupAndTeardown>,
+        usize, // number of empty ones to assume，表示前面要补多少个空的init/teardown chunk。这个和lazy init排序、padding策略有关，后面读chunk_lazy_init_and_teardown时再展开。
+        Vec<ShuffleRamSetupAndTeardown>, //init_and_teardown_chunks
     ),
-    HashMap<u16, Vec<DelegationWitness>>,
-    Vec<FinalRegisterValue>,
+    HashMap<u16, Vec<DelegationWitness>>, //key: delegation type，value: 该delegation type对应的一批delegation witness
+    Vec<FinalRegisterValue>,              //32个RISC-V寄存器最终状态
 ) {
     let cycles_per_circuit = trace_len - 1;
+    // 这不是最终一定会跑这么多cycle，而是上限。如果程序在第10个cycle结束，VM会提前停止
     let max_cycles_to_run = num_instances_upper_bound * cycles_per_circuit;
 
+    // 根据机器配置C返回可用delegation witness工厂
     let delegation_factories = setups::delegation_factories_for_machine::<C, Global>();
 
+    // 按照每个main circuit instance能容纳多少个VM cycle，把整段guest执行切成多个chunk。
     let (
         final_pc,
         main_circuits_witness,
         delegation_circuits_witness,
         final_register_values,
-        init_and_teardown_chunks,
+        init_and_teardown_chunks, //Vec<Vec<(RAM物理地址, (TimestampScalar, 该地址最终值))>>表示被访问过的RAM word集合，分成若干小vector，方便并行收集。
     ) = run_and_split_for_gpu::<ND, C, Global>(
         max_cycles_to_run,
         trace_len,
@@ -204,7 +209,8 @@ pub fn trace_execution_for_gpu<
     );
 
     // we just need to chunk inits/teardowns
-
+    // 把RAM touched words的最终信息整理成每个main circuit chunk对应的ShuffleRamSetupAndTeardown。
+    // 把这些按main circuit数量和cycles_per_circuit分配成电路需要的边界格式。
     let init_and_teardown_chunks = chunk_lazy_init_and_teardown(
         main_circuits_witness.len(),
         cycles_per_circuit,
@@ -221,29 +227,38 @@ pub fn trace_execution_for_gpu<
 }
 
 pub fn prove_image_execution_for_machine_with_gpu_tracers<
+    // ND是non-determinism source，也就是非确定性输入源。
     ND: NonDeterminismCSRSource<VectorMemoryImplWithRom>,
     C: MachineConfig,
+    // A是allocator类型。Airbender会生成很大的trace、LDE数据、CycleData等结构，某些路径需要自定义分配器来控制内存分配。你现在可以先把它记成：A = 大向量/trace使用的内存分配器类型。它不影响VM语义。
     A: GoodAllocator,
 >(
+    // 表示最多允许跑多少个main circuit instance。一个main circuit instance不能无限长。它的trace高度是固定的：trace_len = compiled_circuit.trace_len，其中最后一行通常不放真实VM cycle，所以一个instance最多承载：cycles_per_circuit = trace_len - 1。
+    // 如果程序要执行很多cycle，就切成多个chunk：num_instances_upper_bound就是最多允许多少个这样的chunk。后面trace_execution_for_gpu会用它算最大VM执行步数。
     num_instances_upper_bound: usize,
     bytecode: &[u32],
     non_determinism: ND,
+    // setup阶段的输出
     risc_v_circuit_precomputations: &MainCircuitPrecomputations<C, A>,
+    // Airbender支持delegation circuit。main RISC-V电路遇到某些特殊CSR时，可以把一类计算委托给专门的delegation circuit。这里传进来的是：delegation_type -> 该delegation circuit的setup/precomputations
     delegation_circuits_precomputations: &[(u32, DelegationCircuitPrecomputations<A>)],
     worker: &worker::Worker,
+    // 返回三类对象：main RISC-V circuit proofs、每种delegation type对应的一组delegation proofs、VM结束时32个寄存器的最终值和最后访问timestamp
 ) -> (Vec<Proof>, Vec<(u32, Vec<Proof>)>, Vec<FinalRegisterValue>) {
     let trace_len = risc_v_circuit_precomputations.compiled_circuit.trace_len;
     let cycles_per_circuit = trace_len - 1;
 
+    // LDE是low degree extension。STARK里不会只在原始trace domain上承诺，还会把多项式扩展到更大的domain再做FRI等检查。
     let lde_factor = risc_v_circuit_precomputations
         .lde_precomputations
         .lde_factor;
 
+    // 这里的main_circuits_witness就是VM运行后得到的Vec<CycleData>。
     let (
-        main_circuits_witness,
-        inits_and_teardowns,
-        delegation_circuits_witness,
-        final_register_values,
+        main_circuits_witness, //VM tracing结果，main RISC-V VM每个chunk的CycleData
+        inits_and_teardowns,   // memory argument需要的lazy init / teardown数据
+        delegation_circuits_witness, //delegation circuit的执行记录
+        final_register_values, //VM结束时32个寄存器的最终值和最后访问timestamp
     ) = trace_execution_for_gpu::<ND, C, A>(
         num_instances_upper_bound,
         bytecode,
@@ -426,11 +441,14 @@ pub fn prove_image_execution_for_machine_with_gpu_tracers<
             );
         }
 
+        // 对每个witness_chunk构造
         let oracle = MainRiscVOracle {
             cycle_data: witness_chunk,
         };
 
         let now = std::time::Instant::now();
+
+        // 把CycleData写成witness trace
         let witness_trace = evaluate_witness(
             &risc_v_circuit_precomputations.compiled_circuit,
             risc_v_circuit_precomputations.witness_eval_fn_for_gpu_tracer,

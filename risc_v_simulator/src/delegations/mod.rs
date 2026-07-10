@@ -22,6 +22,7 @@ pub mod blake2_round_function_with_compression_mode;
 pub mod u256_ops_with_control;
 
 #[derive(Clone, Copy, Debug)]
+/// 记录delegation witness。字段包括当前类型日志、所有类型日志、factory表等。
 pub struct DelegationsCSRProcessor;
 
 pub(crate) fn read_words_at_offsets_into<'a, M: MemorySource>(
